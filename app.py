@@ -14,6 +14,9 @@ import concurrent.futures
 import traceback 
 from flask import send_file # ✅ สำหรับส่งไฟล์ดาวน์โหลด
 from converter import ConfigConverter # ✅ Import Class ใหม่
+import time
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import io
 from flask_socketio import SocketIO, emit 
 
@@ -628,17 +631,109 @@ def task_send_command(device, command):
     except Exception as e:
         return {'host': device['hostname'], 'status': 'Failed', 'error': str(e)}
 
-def task_push_config(device, config_lines):
+
+
+
+
+
+
+def task_push_config(device_info, commands):
+    result = {
+        "host": device_info.get('host'),
+        "status": "pending",
+        "log": "",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+
     try:
-        driver = get_device_driver(device)
-        net_connect = ConnectHandler(**driver)
-        output = net_connect.send_config_set(config_lines)
-        if "cisco" in device['device_type']:
-            net_connect.send_command("write memory")
+        print(f"🚀 Starting config for: {device_info.get('host')}")
+        
+        # ✅ สร้าง Dictionary ใหม่ เอาเฉพาะที่ Netmiko ต้องใช้
+        netmiko_params = {
+            'device_type': device_info.get('device_type'),
+            'host': device_info.get('host'),
+            'username': device_info.get('username'),
+            'password': device_info.get('password'),
+            'port': device_info.get('port', 22), # Default port 22 ถ้าไม่มี
+        }
+        
+        # ถ้ามี secret (Enable Password) ก็ใส่ไปด้วย
+        if device_info.get('secret'):
+            netmiko_params['secret'] = device_info.get('secret')
+
+        # เชื่อมต่อด้วยตัวแปรที่กรองแล้ว
+        net_connect = ConnectHandler(**netmiko_params)
+        
+        # ถ้าต้องเข้า Enable mode
+        if device_info.get('secret'):
+            net_connect.enable()
+        
+        # ส่ง Config
+        output = net_connect.send_config_set(commands)
+        
+        result["status"] = "success"
+        result["log"] = output
+        
         net_connect.disconnect()
-        return {'host': device['hostname'], 'status': 'Success', 'log': output}
+        print(f"✅ Finished: {device_info.get('host')}")
+
     except Exception as e:
-        return {'host': device['hostname'], 'status': 'Failed', 'error': str(e)}
+        print(f"❌ Error {device_info.get('host')}: {str(e)}")
+        result["status"] = "failed"
+        result["log"] = str(e)
+    
+    return result
+
+
+
+    # ---------------------------------------------------------
+# 2. API Route: รับคำสั่ง Batch Config
+# ---------------------------------------------------------
+@app.route('/api/batch_config', methods=['POST'])
+def api_batch_config():
+    data = request.json
+    
+    # รับข้อมูลจาก Frontend
+    target_devices = data.get('devices', []) # List ของอุปกรณ์ที่ติ๊กเลือกมา
+    config_commands = data.get('commands', []) # List ของคำสั่ง (เช่น ['vlan 10', 'name SALES'])
+    
+    if not target_devices or not config_commands:
+        return jsonify({"error": "Missing devices or commands"}), 400
+
+    results = []
+    
+    # 🔥 เริ่มทำงานแบบ ThreadPool (Parallel)
+    # max_workers=10 คือทำพร้อมกันสูงสุด 10 ตัว (ปรับได้ตามความแรงเครื่อง Server)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        # สร้าง List ของงาน (Future objects)
+        future_to_device = {
+            executor.submit(task_push_config, device, config_commands): device 
+            for device in target_devices
+        }
+        
+        # รอรับผลลัพธ์เมื่องานเสร็จ (as_completed)
+        for future in as_completed(future_to_device):
+            device = future_to_device[future]
+            try:
+                data = future.result()
+                results.append(data)
+            except Exception as exc:
+                # กันเหนียวเผื่อ Worker ตาย
+                results.append({
+                    "hostname": device.get('hostname'),
+                    "status": "failed",
+                    "log": f"Worker Exception: {exc}"
+                })
+
+    # ส่งผลลัพธ์กลับไปให้ Frontend แสดงผล
+    return jsonify({
+        "summary": {
+            "total": len(target_devices),
+            "success": len([r for r in results if r['status'] == 'success']),
+            "failed": len([r for r in results if r['status'] == 'failed'])
+        },
+        "details": results
+    })
     
 
 def get_backup_command(device_type):
@@ -806,4 +901,3 @@ def get_backups():
 
 if __name__ == '__main__':
     socketio.run(app, host="0.0.0.0", port=5000, debug=True)
-    print(f"🚀 Flask Server running on http://192.168.74.1:5000")
