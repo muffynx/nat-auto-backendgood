@@ -141,10 +141,8 @@ def on_agent_auth_success(payload):
     user = payload.get('user')
     if user:
         allowed_user = user
-        sio.enter_room(user)  # Join room เพื่อรับ task เฉพาะ
-        print(f"[AUTH SUCCESS] Authorized for user: {user}")
-        print("   Joined room:", user)
-        print("   Ready to receive tasks")
+        # Server-side join_room(user) ใน handle_register_agent จัดการให้แล้ว
+        print(f"[AUTH SUCCESS] Authorized for user: {user} — Ready to receive tasks")
     else:
         print("[AUTH WARNING] No user assigned")
 

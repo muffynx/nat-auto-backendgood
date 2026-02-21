@@ -45,6 +45,18 @@ except Exception as e:
 #             HELPER FUNCTIONS
 # ────────────────────────────────────────────────
 
+def serialize_doc(doc: dict) -> dict:
+    """Convert MongoDB doc to JSON-serializable dict (ObjectId → str, datetime → ISO string)"""
+    result = {}
+    for k, v in doc.items():
+        if isinstance(v, ObjectId):
+            result[k] = str(v)
+        elif isinstance(v, (dt.datetime, datetime)):
+            result[k] = v.isoformat()
+        else:
+            result[k] = v
+    return result
+
 def get_backup_command(device_type):
     # แปลงเป็นตัวพิมพ์เล็กกันพลาด
     dtype = device_type.lower()
@@ -137,7 +149,6 @@ def get_device_driver(device):
 # ────────────────────────────────────────────────
 #             SOCKET.IO - รับผลจาก Agent
 # ────────────────────────────────────────────────
-
 @socketio.on('task_result')
 def handle_task_result(data):
     task_type = data.get('type')
@@ -147,6 +158,7 @@ def handle_task_result(data):
 
     print(f"[TASK RESULT] {task_type} - {hostname} - {status} (owner: {owner})")
 
+    # 1. กรณีเป็นงาน Backup
     if task_type == 'backup':
         backup_doc = {
             'device_id': data.get('device_id'),
@@ -156,12 +168,14 @@ def handle_task_result(data):
             'status': status,
             'timestamp': dt.datetime.now(thai_tz),
         }
+        
         if status == 'Failed':
             backup_doc['config_data'] = data.get('output', str(data.get('error', 'Unknown error')))
 
+        # บันทึกลง DB
         db.backups.insert_one(backup_doc)
 
-        # ส่งต่อไป frontend เฉพาะ room ของ owner (ลด delay และ traffic)
+        # ส่งต่อไป frontend
         emit('backup_update', {
             'device_id': data.get('device_id'),
             'hostname': hostname,
@@ -171,6 +185,10 @@ def handle_task_result(data):
             'output': data.get('output', '')
         }, room=owner)
 
+    # 2. กรณีเป็นงาน Command / Config (✅ elif ต้องอยู่ระดับเดียวกับ if ด้านบน)
+    elif task_type in ['run_command', 'push_config', 'batch_config']:
+        # ส่ง event ชื่อ 'terminal_update' กลับไปให้หน้าเว็บ
+        socketio.emit('terminal_update', data)
     # สามารถเพิ่ม event อื่น ๆ ได้ตามต้องการ
 
 
@@ -249,9 +267,8 @@ def run_backup():
     if not devices:
         return jsonify({'message': 'No devices found'}), 200
 
-    # แปลง ObjectId เป็น str ก่อนส่ง
-    for dev in devices:
-        dev['_id'] = str(dev['_id'])
+    # แปลง ObjectId และ datetime เป็น str ก่อนส่ง
+    devices = [serialize_doc(dev) for dev in devices]
 
     socketio.emit('execute_task', {
         'type': 'batch_backup',
@@ -329,8 +346,8 @@ def run_single_command():
     if not device:
         return jsonify({'status': 'Failed', 'output': 'Device not found or access denied'}), 404
 
-    # แปลง _id เป็น str ก่อนส่งให้ agent
-    device['_id'] = str(device['_id'])
+    # แปลง _id และ datetime ทุก field เป็น str ก่อนส่งให้ agent
+    device = serialize_doc(device)
 
     # ส่งงานไป agent พร้อม profile_id
     socketio.emit('execute_task', {
@@ -683,7 +700,7 @@ def delete_device(id):
 ######## API: Generate Agent Key สำหรับ profile นี้
 ######## API: Generate Agent Key สำหรับ profile นี้
 
-import secrets  # ต้อง import ไว้ด้านบนถ้ายังไม่มี
+
 
 # API: Generate Agent Key สำหรับ user นี้ (gen แค่ครั้งเดียวก็พอใช้ได้ตลอด)
 @app.route('/api/generate_agent_key', methods=['POST'])
