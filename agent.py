@@ -1,33 +1,35 @@
 import socketio
 import time
+import os
+from dotenv import load_dotenv
 from netmiko import ConnectHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
+
+load_dotenv()
 
 # ────────────────────────────────────────────────
 #               CONFIGURATION
 # ────────────────────────────────────────────────
 
-VPS_URL = 'http://192.168.74.1:5000'   # ← แก้เป็น IP จริงของ server
+VPS_URL = 'http://192.168.74.1:5000'
 
-MAX_WORKERS = 10
+MAX_WORKERS = 20  # เพิ่มได้ถ้าเครื่องแรง
+
+AGENT_KEY = os.getenv('AGENT_KEY')
+if not AGENT_KEY:
+    print("ERROR: ต้องตั้งค่า AGENT_KEY ใน .env")
+    print("ตัวอย่าง: AGENT_KEY=agk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+    exit(1)
 
 sio = socketio.Client(
     reconnection=True,
-    reconnection_delay=5,
-    reconnection_attempts=0
+    reconnection_delay=2,  # ลด delay
+    reconnection_attempts=999
 )
 
-# ตัวแปรที่ใช้เก็บ key จาก frontend
-current_agent_key = None
-
-# ตัวแปรที่ backend จะยืนยันว่าอนุญาตให้ agent นี้ทำงานในชื่อ user ไหน
 allowed_user = None
-@sio.on('*')
-def catch_all(event, *args):
-    print(f"[DEBUG] Received unknown/all event: {event}")
-    print(f"[DEBUG] Args: {args}")
-
+print(f"[START] Agent started with key: {AGENT_KEY[:8]}...")
 # ────────────────────────────────────────────────
 #               HELPER FUNCTIONS
 # ────────────────────────────────────────────────
@@ -124,11 +126,8 @@ def task_run_command(device, command):
 @sio.event
 def connect():
     print(f"🚀 Connected to server → {VPS_URL}")
-    if current_agent_key:
-        sio.emit('register_agent', {'agent_key': current_agent_key})
-        print(f"   Registered with agent key: {current_agent_key[:8]}...")
-    else:
-        print("   Waiting for agent key from frontend...")
+    sio.emit('register_agent', {'agent_key': AGENT_KEY})
+    print(f"   Registered with agent key: {AGENT_KEY[:8]}...")
 
 
 @sio.event
@@ -136,38 +135,16 @@ def disconnect():
     print("⚠️ Disconnected from server")
 
 
-@sio.on('set_agent_key')
-def on_set_agent_key(payload):
-    print("[DEBUG] set_agent_key handler STARTED!")  # ← เพิ่มบรรทัดนี้
-    print("[DEBUG] Received payload:", payload)      # ← เพิ่มบรรทัดนี้
-
-    global current_agent_key
-    new_key = payload.get('agent_key')
-    
-    if not new_key:
-        print("[AGENT] Received empty agent key from frontend")
-        return
-
-    if new_key == current_agent_key:
-        print("[AGENT] Same key received, no change")
-        return
-
-    current_agent_key = new_key
-    print(f"[AGENT] Received new agent key from frontend: {new_key[:8]}...{new_key[-4:]}")
-
-    sio.emit('register_agent', {'agent_key': current_agent_key})
-    print("[AGENT] Sent 'register_agent' to backend with key:", current_agent_key[:8] + "...")
-
-
-# รับการยืนยันจาก backend ว่าอนุญาตให้ทำงานในชื่อ user ไหน
 @sio.on('agent_auth_success')
 def on_agent_auth_success(payload):
     global allowed_user
     user = payload.get('user')
     if user:
         allowed_user = user
-        print(f"[AUTH SUCCESS] Agent authorized for user: {user}")
-        print("   Agent is now ready to receive tasks for this user only")
+        sio.enter_room(user)  # Join room เพื่อรับ task เฉพาะ
+        print(f"[AUTH SUCCESS] Authorized for user: {user}")
+        print("   Joined room:", user)
+        print("   Ready to receive tasks")
     else:
         print("[AUTH WARNING] No user assigned")
 
@@ -176,24 +153,22 @@ def on_agent_auth_success(payload):
 def on_agent_auth_failed(payload):
     msg = payload.get('message', 'Unknown error')
     print(f"[AUTH FAILED] {msg}")
-    print("   Please check your Agent Key and try again in frontend")
+    # Reconnect จะพยายามใหม่เอง
 
 
-# ทำงาน task เฉพาะที่ owner ตรงกับ allowed_user
 @sio.on('execute_task')
 def on_execute_task(payload):
     if allowed_user is None:
-        print("[SKIP] Agent not yet authorized (no allowed user)")
+        print("[SKIP] Not authorized yet")
         return
 
     task_owner = payload.get('owner')
-
     if task_owner != allowed_user:
-        print(f"[SKIP] Task owner '{task_owner}' but agent allowed only '{allowed_user}'")
+        print(f"[SKIP] Owner mismatch: {task_owner} != {allowed_user}")
         return
 
     task_type = payload.get('type')
-    print(f"\n📦 Executing task: {task_type} (owner: {task_owner})")
+    print(f"📦 Executing {task_type} (owner: {task_owner})")
 
     owner = payload.get('owner')  # สำหรับ log ใน task_result
 
@@ -333,9 +308,8 @@ if __name__ == '__main__':
         try:
             if not sio.connected:
                 print(f"Connecting to {VPS_URL} ...")
-                sio.connect(VPS_URL, wait_timeout=10)
+                sio.connect(VPS_URL, wait_timeout=5)
             sio.wait()
         except Exception as e:
             print(f"Connection error: {e}")
-            print("Reconnecting in 5 seconds...")
-            time.sleep(5)
+            time.sleep(2)  # ลด delay

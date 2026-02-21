@@ -3,7 +3,7 @@ eventlet.monkey_patch()
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO, emit, join_room
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 import datetime as dt
@@ -12,38 +12,22 @@ import traceback
 import io
 import os
 from datetime import datetime, timezone, timedelta
+import secrets  # สำหรับ gen key
 
-# สำหรับ environment variable
-# สมมติว่าคุณใช้ไฟล์ .env หรือ env module ของคุณเอง
 import env
 from dotenv import load_dotenv
 load_dotenv()
 
-# ถ้ามี converter สำหรับ config → เก็บไว้
-from converter import ConfigConverter  # ถ้ายังใช้อยู่
+from converter import ConfigConverter
+
 app = Flask(__name__)
-
-# ✅ สำคัญ — เปิด CORS ทุก origin
-CORS(app, resources={r"/*": {"origins": "*"}})
-
-# ✅ สำคัญ — config socketio
-socketio = SocketIO(
-    app,
-    cors_allowed_origins="*",
-    async_mode="eventlet",
-    logger=True,
-    engineio_logger=True
-)
-@app.route("/")
-def index():
-    return jsonify({"status": "Server is running"})
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 thai_tz = timezone(timedelta(hours=7))
 
-# ────────────────────────────────────────────────
-#                  DATABASE
-# ────────────────────────────────────────────────
-MONGO_URI = env.get_env_variable('PYTHON_MONGODB_URI')  # หรือ os.getenv("MONGO_URI")
+# DATABASE
+MONGO_URI = env.get_env_variable('PYTHON_MONGODB_URI')
 
 client = None
 db = None
@@ -58,7 +42,7 @@ except Exception as e:
     print(f"❌ MongoDB Connection Error: {e}")
 
 # ────────────────────────────────────────────────
-#             HELPER FUNCTIONS (ไม่ต้อง SSH)
+#             HELPER FUNCTIONS
 # ────────────────────────────────────────────────
 
 def get_backup_command(device_type):
@@ -161,7 +145,7 @@ def handle_task_result(data):
     hostname = data.get('hostname')
     owner = data.get('owner')
 
-    print(f"[TASK RESULT] {task_type} - {hostname} - {status}")
+    print(f"[TASK RESULT] {task_type} - {hostname} - {status} (owner: {owner})")
 
     if task_type == 'backup':
         backup_doc = {
@@ -177,7 +161,7 @@ def handle_task_result(data):
 
         db.backups.insert_one(backup_doc)
 
-        # ส่งต่อไป frontend (broadcast หรือเฉพาะ user ถ้ามี room)
+        # ส่งต่อไป frontend เฉพาะ room ของ owner (ลด delay และ traffic)
         emit('backup_update', {
             'device_id': data.get('device_id'),
             'hostname': hostname,
@@ -185,11 +169,7 @@ def handle_task_result(data):
             'percent': 100 if status in ['Success', 'Failed'] else data.get('percent', 50),
             'msg': 'Backup Complete' if status == 'Success' else 'Backup Failed',
             'output': data.get('output', '')
-        }, broadcast=True)
-
-    elif task_type in ['batch_config', 'push_config']:
-        # อาจบันทึก summary หรือ log แยกก็ได้
-        pass
+        }, room=owner)
 
     # สามารถเพิ่ม event อื่น ๆ ได้ตามต้องการ
 
@@ -197,6 +177,30 @@ def handle_task_result(data):
 # ────────────────────────────────────────────────
 #             API ROUTES
 # ────────────────────────────────────────────────
+
+@socketio.on('register_agent')
+def handle_register_agent(data):
+    agent_key = data.get('agent_key')
+    if not agent_key:
+        emit('agent_auth_failed', {'message': 'No agent_key provided'})
+        return
+
+    key_doc = db.agent_keys.find_one({'key': agent_key, 'is_active': True})
+    if not key_doc:
+        emit('agent_auth_failed', {'message': 'Invalid or inactive agent key'})
+        return
+
+    user = key_doc['user']
+    db.agent_keys.update_one(
+        {'key': agent_key},
+        {'$set': {'last_used': dt.datetime.now(thai_tz)}}
+    )
+
+    # Join room ชื่อ user เพื่อรับ task เฉพาะ
+    join_room(user)
+
+    emit('agent_auth_success', {'user': user})
+    print(f"Agent authenticated and joined room: {user}")
 
 @app.route('/api/batch_config', methods=['POST'])
 def api_batch_config():
@@ -672,26 +676,6 @@ def delete_device(id):
 
 
 
-@socketio.on('register_agent')
-def handle_register_agent(data):
-    agent_key = data.get('agent_key')
-    if not agent_key:
-        emit('agent_auth_failed', {'message': 'No agent_key provided'})
-        return
-
-    key_doc = db.agent_keys.find_one({'key': agent_key, 'is_active': True})
-    if not key_doc:
-        emit('agent_auth_failed', {'message': 'Invalid or inactive agent key'})
-        return
-
-    user = key_doc['user']
-    db.agent_keys.update_one(
-        {'key': agent_key},
-        {'$set': {'last_used': dt.datetime.now(thai_tz)}}
-    )
-
-    emit('agent_auth_success', {'user': user})
-    print(f"Agent authenticated for user: {user}")
 
 
 
@@ -708,25 +692,19 @@ def generate_agent_key():
     if not current_user:
         return jsonify({'error': 'Unauthorized'}), 401
 
-    # เช็คว่ามี key อยู่แล้วหรือยัง (ถ้ามี → คืนค่าเดิมให้เลย ไม่ต้อง gen ใหม่)
-    existing = db.agent_keys.find_one({
-        'user': current_user,
-        'is_active': True
-    })
-
+    existing = db.agent_keys.find_one({'user': current_user, 'is_active': True})
     if existing:
         return jsonify({
             'status': 'exists',
             'agent_key': existing['key'],
-            'message': 'คุณมี Agent Key อยู่แล้ว สามารถใช้ค่านี้ได้เลย'
+            'message': 'คุณมี Agent Key อยู่แล้ว'
         })
 
-    # Generate key ใหม่ (64 ตัวอักษร hex)
     key = secrets.token_hex(32)
 
     db.agent_keys.insert_one({
         'key': key,
-        'user': current_user,          # ผูกกับ username แทน profile_id
+        'user': current_user,
         'created_at': dt.datetime.now(thai_tz),
         'last_used': None,
         'is_active': True
@@ -735,7 +713,7 @@ def generate_agent_key():
     return jsonify({
         'status': 'success',
         'agent_key': key,
-        'message': 'คัดลอก Agent Key นี้ไปตั้งค่าในตัวแปร AGENT_KEY ของ agent.py แล้วรันใหม่'
+        'message': 'คัดลอก Agent Key นี้ไปตั้งค่าใน .env ของ agent แล้ว restart agent'
     })
 
 
