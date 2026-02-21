@@ -4,4 +4,3 @@ pymongo[srv]
 netmiko
 dnspython
 certifi
-flask-socketio

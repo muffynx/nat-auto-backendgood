@@ -21,22 +21,10 @@ load_dotenv()
 
 # ถ้ามี converter สำหรับ config → เก็บไว้
 from converter import ConfigConverter  # ถ้ายังใช้อยู่
+
 app = Flask(__name__)
-
-# ✅ สำคัญ — เปิด CORS ทุก origin
-CORS(app, resources={r"/*": {"origins": "*"}})
-
-# ✅ สำคัญ — config socketio
-socketio = SocketIO(
-    app,
-    cors_allowed_origins="*",
-    async_mode="eventlet",
-    logger=True,
-    engineio_logger=True
-)
-@app.route("/")
-def index():
-    return jsonify({"status": "Server is running"})
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 thai_tz = timezone(timedelta(hours=7))
 
@@ -62,23 +50,16 @@ except Exception as e:
 # ────────────────────────────────────────────────
 
 def get_backup_command(device_type):
-    # แปลงเป็นตัวพิมพ์เล็กกันพลาด
     dtype = device_type.lower()
-    
-    if "cisco" in dtype or "aruba_osswitch" in dtype or "aruba_aoscx" in dtype or "aruba" in dtype:
+    if "cisco" in dtype or "aruba" in dtype:
         return "show running-config"
-        
+    elif "hp" in dtype or "comware" in dtype or "huawei" in dtype:
+        return "display current-configuration"
     elif "juniper" in dtype:
         return "show configuration"
-        
-    elif "hp_comware" in dtype or "huawei" in dtype or "hp" in dtype or "comware" in dtype:
-        return "display current-configuration"
-        
     elif "fortinet" in dtype:
         return "show full-configuration"
-        
-    else:
-        return "show running-config" # Default
+    return "show running-config"
 
 
 def parse_vlan_range(vlan_str):
@@ -134,20 +115,6 @@ def generate_bulk_vlan_config(device_type, vlan_str, vlan_name_prefix, svi_id, i
             configs.append("quit")
 
     return configs
-
-def get_device_driver(device):
-    return {
-        'device_type': device['device_type'],
-        'host': device['ip_address'],
-        'username': device['username'],
-        'password': device['password'],
-        'secret': device.get('secret', ''),
-        'port': int(device.get('port', 22)),
-        'global_delay_factor': 0.5,
-        'fast_cli': True,           # ✅ เปิดโหมด Fast (ช่วยได้เยอะใน Cisco/Aruba)
-        'banner_timeout': 10,       # เผื่อ Banner ยาว
-        'auth_timeout': 10,         # เผื่อ Authentication ช้า
-    }
 
 
 # ────────────────────────────────────────────────
@@ -207,18 +174,16 @@ def api_batch_config():
     data = request.json
     devices = data.get('devices', [])          # list of device dicts
     commands = data.get('commands', [])
-    profile_id = data.get('profile_id')  # รับจาก frontend
 
     if not devices or not commands:
         return jsonify({'error': 'Missing devices or commands'}), 400
 
-    # ส่งงานไป agent พร้อม profile_id
+    # ส่งงานไป agent ทุกตัวที่เชื่อมต่อ (agent จะกรองเองถ้ามี site_id)
     socketio.emit('execute_task', {
         'type': 'batch_config',
         'devices': devices,
         'commands': commands,
-        'owner': current_user,
-        'profile_id': profile_id
+        'owner': current_user
     })
 
     return jsonify({
@@ -252,8 +217,7 @@ def run_backup():
     socketio.emit('execute_task', {
         'type': 'batch_backup',
         'devices': devices,
-        'owner': current_user,
-        'profile_id': profile_id
+        'owner': current_user
     })
 
     return jsonify({
@@ -276,7 +240,6 @@ def config_vlan_ip():
     svi_id = data.get('svi_id')
     ip_address = data.get('ip_address')
     subnet_mask = data.get('subnet_mask')
-    profile_id = data.get('profile_id')
 
     if not device or not vlan_range:
         return jsonify({'error': 'Missing parameters'}), 400
@@ -290,13 +253,12 @@ def config_vlan_ip():
         subnet_mask
     )
 
-    # ส่งไป agent พร้อม profile_id
+    # ส่งไป agent
     socketio.emit('execute_task', {
         'type': 'push_config',
         'device': device,
         'commands': config_lines,
-        'owner': current_user,
-        'profile_id': profile_id
+        'owner': current_user
     })
 
     return jsonify({
@@ -306,42 +268,7 @@ def config_vlan_ip():
     })
 
 
-@app.route('/api/run_single_command', methods=['POST'])
-def run_single_command():
-    current_user = request.headers.get('X-Username')
-    if not current_user:
-        return jsonify({'status': 'Failed', 'output': 'Unauthorized'}), 401
-
-    data = request.json
-    device_id = data.get('device_id')
-    command = data.get('command')
-    profile_id = data.get('profile_id')
-
-    if not device_id or not command:
-        return jsonify({'status': 'Failed', 'output': 'Missing device_id or command'}), 400
-
-    # หา device
-    device = db.devices.find_one({'_id': ObjectId(device_id), 'owner': current_user})
-    if not device:
-        return jsonify({'status': 'Failed', 'output': 'Device not found or access denied'}), 404
-
-    # แปลง _id เป็น str ก่อนส่งให้ agent
-    device['_id'] = str(device['_id'])
-
-    # ส่งงานไป agent พร้อม profile_id
-    socketio.emit('execute_task', {
-        'type': 'run_command',
-        'device': device,
-        'command': command,
-        'owner': current_user,
-        'profile_id': profile_id
-    })
-
-    return jsonify({
-        'status': 'dispatched',
-        'message': 'Command execution task sent to agent'
-    })
-
+# ตัวอย่าง API อื่น ๆ ที่ยังคงอยู่ (ปรับให้ส่งผ่าน socket ได้ตามต้องการ)
 
 @app.route('/api/devices', methods=['GET'])
 def get_devices():
@@ -361,34 +288,14 @@ def get_devices():
     return jsonify(devices)
 
 
-@app.route('/api/backups', methods=['GET'])
-def get_backups():
-    current_user = request.headers.get('X-Username')
-    profile_id = request.args.get('profile_id')
-    if not current_user:
-        return jsonify([])
 
-    query = {'owner': current_user}
 
-    if profile_id:
-        profile_devices = list(db.devices.find(
-            {'owner': current_user, 'profile_id': profile_id},
-            {'_id': 1}
-        ))
-        device_ids = [str(d['_id']) for d in profile_devices]
-        if device_ids:
-            query['device_id'] = {'$in': device_ids}
-        else:
-            return jsonify([])
-
-    backups = list(db.backups.find(query).sort('timestamp', -1).limit(100))
-    for b in backups:
-        b['_id'] = str(b['_id'])
-        b['device_id'] = str(b.get('device_id', ''))
-    return jsonify(backups)
+# ... API อื่น ๆ เช่น login, users, profiles, convert_config ฯลฯ ยังคงเหมือนเดิม ...
 
 
 # --- USER MANAGEMENT API ---
+
+
 
 
 # ✅ API: Convert Config
@@ -608,7 +515,9 @@ def create_user():
     return jsonify({'msg': '✅ User created successfully'})
 
 
-# ✅ API สำหรับแก้ไขอุปกรณ์ (Update Device)
+
+
+    # ✅ API สำหรับแก้ไขอุปกรณ์ (Update Device)
 @app.route('/api/devices/<id>', methods=['PUT'])
 def update_device(id):
     current_user = request.headers.get('X-Username')
@@ -640,8 +549,47 @@ def update_device(id):
     else:
         return jsonify({'msg': 'Device not found or permission denied'}), 404
 
+def get_device_driver(device):
+    return {
+        'device_type': device['device_type'],
+        'host': device['ip_address'],
+        'username': device['username'],
+        'password': device['password'],
+        'secret': device.get('secret', ''),
+        'port': int(device.get('port', 22)),
+        'global_delay_factor': 0.5,
+        'fast_cli': True,           # ✅ เปิดโหมด Fast (ช่วยได้เยอะใน Cisco/Aruba)
+        'banner_timeout': 10,       # เผื่อ Banner ยาว
+        'auth_timeout': 10,         # เผื่อ Authentication ช้า
+    }
+
+
+
+
+
+def get_backup_command(device_type):
+    # แปลงเป็นตัวพิมพ์เล็กกันพลาด
+    dtype = device_type.lower()
+    
+    if "cisco" in dtype or "aruba_osswitch" in dtype or "aruba_aoscx" in dtype:
+        return "show running-config"
+        
+    elif "juniper" in dtype:
+        return "show configuration"
+        
+    elif "hp_comware" in dtype or "huawei" in dtype:
+        return "display current-configuration"
+        
+    elif "fortinet" in dtype:
+        return "show full-configuration"
+        
+    else:
+        return "show running-config" # Default
+
+
 
 # --- API ROUTES (ส่วนสำคัญที่ต้องกรอง User) ---
+
 
 
 @app.route('/api/devices', methods=['POST'])
@@ -672,108 +620,43 @@ def delete_device(id):
 
 
 
-@socketio.on('register_agent')
-def handle_register_agent(data):
-    agent_key = data.get('agent_key')
-    if not agent_key:
-        emit('agent_auth_failed', {'message': 'No agent_key provided'})
-        return
-
-    key_doc = db.agent_keys.find_one({'key': agent_key, 'is_active': True})
-    if not key_doc:
-        emit('agent_auth_failed', {'message': 'Invalid or inactive agent key'})
-        return
-
-    user = key_doc['user']
-    db.agent_keys.update_one(
-        {'key': agent_key},
-        {'$set': {'last_used': dt.datetime.now(thai_tz)}}
-    )
-
-    emit('agent_auth_success', {'user': user})
-    print(f"Agent authenticated for user: {user}")
-
-
-
-
-######## API: Generate Agent Key สำหรับ profile นี้
-######## API: Generate Agent Key สำหรับ profile นี้
-
-import secrets  # ต้อง import ไว้ด้านบนถ้ายังไม่มี
-
-# API: Generate Agent Key สำหรับ user นี้ (gen แค่ครั้งเดียวก็พอใช้ได้ตลอด)
-@app.route('/api/generate_agent_key', methods=['POST'])
-def generate_agent_key():
+@app.route('/api/backups', methods=['GET'])
+def get_backups():
     current_user = request.headers.get('X-Username')
-    if not current_user:
-        return jsonify({'error': 'Unauthorized'}), 401
+    profile_id = request.args.get('profile_id') # ✅ รับค่า profile_id จาก Frontend
+    if not current_user: return jsonify([])
+    query = {'owner': current_user}
 
-    # เช็คว่ามี key อยู่แล้วหรือยัง (ถ้ามี → คืนค่าเดิมให้เลย ไม่ต้อง gen ใหม่)
-    existing = db.agent_keys.find_one({
-        'user': current_user,
-        'is_active': True
-    })
-
-    if existing:
-        return jsonify({
-            'status': 'exists',
-            'agent_key': existing['key'],
-            'message': 'คุณมี Agent Key อยู่แล้ว สามารถใช้ค่านี้ได้เลย'
-        })
-
-    # Generate key ใหม่ (64 ตัวอักษร hex)
-    key = secrets.token_hex(32)
-
-    db.agent_keys.insert_one({
-        'key': key,
-        'user': current_user,          # ผูกกับ username แทน profile_id
-        'created_at': dt.datetime.now(thai_tz),
-        'last_used': None,
-        'is_active': True
-    })
-
-    return jsonify({
-        'status': 'success',
-        'agent_key': key,
-        'message': 'คัดลอก Agent Key นี้ไปตั้งค่าในตัวแปร AGENT_KEY ของ agent.py แล้วรันใหม่'
-    })
+    if profile_id:
+        # 1. ไปหา ID ของอุปกรณ์ทั้งหมดใน Profile นี้มาก่อน
+        profile_devices = list(db.devices.find({'owner': current_user, 'profile_id': profile_id}, {'_id': 1}))
+        
+        # 2. แปลง ObjectId เป็น String (เพราะใน Logs เราเก็บ device_id เป็น String)
+        target_device_ids = [str(d['_id']) for d in profile_devices]
+        
+        # 3. สั่งให้หา Log เฉพาะที่มี device_id อยู่ในรายการนี้
+        query['device_id'] = {'$in': target_device_ids}
 
 
-# API: แสดงรายการ Agent Key ทั้งหมดของ user นี้ (optional)
-@app.route('/api/agent_keys', methods=['GET'])
-def list_agent_keys():
-    current_user = request.headers.get('X-Username')
-    if not current_user:
-        return jsonify([])
+        # ถ้า Profile นี้ไม่มี Device เลย -> ก็ต้องไม่คืนค่า Log อะไรเลยกลับไป
+        if not profile_devices:
+            return jsonify([]) 
+            
+        target_device_ids = [str(d['_id']) for d in profile_devices]
+        query['device_id'] = {'$in': target_device_ids}
 
-    keys = list(db.agent_keys.find({
-        'user': current_user,
-        'is_active': True
-    }, {
-        'key': 1,
-        'created_at': 1,
-        'last_used': 1,
-        '_id': 0
-    }))
+    backups = list(db.backups.find(query).sort('timestamp', -1).limit(50))
+    
+    for b in backups:
+        b['_id'] = str(b['_id'])
+            
+    # ✅ ดึงเฉพาะ Log ของ User นี้
+    logs = list(db.backups.find({'owner': current_user}).sort('timestamp', -1).limit(50))
+    for log in logs:
+        log['_id'] = str(log['_id'])
+        log['device_id'] = str(log.get('device_id', ''))
+    return jsonify(logs)
 
-    return jsonify(keys)
 
-
-# API: Revoke (ลบ/ยกเลิก) Agent Key
-@app.route('/api/agent_keys/<key>', methods=['DELETE'])
-def revoke_agent_key(key):
-    current_user = request.headers.get('X-Username')
-    if not current_user:
-        return jsonify({'error': 'Unauthorized'}), 401
-
-    result = db.agent_keys.delete_one({
-        'key': key,
-        'user': current_user
-    })
-
-    if result.deleted_count > 0:
-        return jsonify({'msg': 'Agent Key ถูกยกเลิกเรียบร้อยแล้ว'})
-    else:
-        return jsonify({'msg': 'ไม่พบ Agent Key หรือไม่มีสิทธิ์'}), 404
 if __name__ == '__main__':
     socketio.run(app, host="0.0.0.0", port=5000, debug=True, allow_unsafe_werkzeug=True)

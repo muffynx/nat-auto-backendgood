@@ -1,0 +1,346 @@
+import env
+from dotenv import load_dotenv
+load_dotenv()
+import eventlet
+eventlet.monkey_patch()
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from pymongo import MongoClient
+from bson.objectid import ObjectId
+# netmiko ยังคงไว้ใน requirements.txt สำหรับ agent.py — Brain ไม่ใช้แล้ว
+import datetime as dt
+import certifi
+import concurrent.futures 
+import traceback 
+from flask import send_file
+from converter import ConfigConverter
+import time
+import jwt
+from functools import wraps
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import io
+from flask_socketio import SocketIO, emit 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+
+from datetime import timezone, timedelta
+
+thai_tz = timezone(timedelta(hours=7))
+datetime.now(thai_tz)
+
+
+app = Flask(__name__)
+CORS(app) 
+import os
+
+
+
+
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+
+# --- DATABASE CONFIG ---
+# ⚠️ อย่าลืมเช็ค Password ใน MONGO_URI อีกทีนะครับ
+MONGO_URI = env.get_env_variable('PYTHON_MONGODB_URI')
+
+
+users_col = None
+db = None
+
+try:
+    client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
+    db = client['net_automation']
+    users_col = db['users'] 
+    print("✅ Connected to MongoDB Atlas")
+except Exception as e:
+    print(f"❌ MongoDB Connection Error: {e}")
+
+# --- JWT CONFIG ---
+JWT_SECRET = env.get_env_variable('JWT_SECRET')
+JWT_EXPIRY_HOURS = 24  # Token หมดอายุใน 24 ชั่วโมง
+
+def token_required(f):
+    """Decorator ตรวจสอบ JWT token ก่อนเข้า route"""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        auth_header = request.headers.get('Authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            token = auth_header.split(' ')[1]
+        if not token:
+            return jsonify({'status': 'error', 'msg': 'Token is missing'}), 401
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+            current_user = payload['username']
+        except jwt.ExpiredSignatureError:
+            return jsonify({'status': 'error', 'msg': 'Token has expired, please login again'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'status': 'error', 'msg': 'Invalid token'}), 401
+        return f(current_user, *args, **kwargs)
+    return decorated
+
+
+
+
+# --- USER MANAGEMENT API ---
+
+
+
+
+# ✅ API: Convert Config
+@app.route('/api/convert_config', methods=['POST'])
+def convert_config_api():
+    current_user = request.headers.get('X-Username')
+    if not current_user: return jsonify({'msg': 'Unauthorized'}), 401
+
+    source_type = None
+    target_type = None
+    log_content = None
+
+    # CASE 1: Excel Upload
+    if request.content_type and 'multipart/form-data' in request.content_type:
+        source_type = request.form.get('source_type')
+        target_type = request.form.get('target_type')
+        if 'file' not in request.files: return jsonify({'msg': 'No file'}), 400
+        log_content = request.files['file'].read() # bytes
+
+    # CASE 2: Text JSON
+    else:
+        data = request.json
+        source_type = data.get('source_type')
+        target_type = data.get('target_type')
+        log_content = data.get('log_content') # string
+
+    if not source_type or not target_type or not log_content:
+        return jsonify({'status': 'error', 'msg': 'Missing parameters'}), 400
+
+    try:
+        # ✅ เรียกใช้ Class (ตอนนี้ __init__ รับ 3 ค่าแล้ว ถูกต้อง)
+        converter = ConfigConverter(source_type, target_type, log_content)
+        result_config = converter.process()
+
+        return jsonify({'status': 'success', 'output': result_config})
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'msg': str(e)}), 500
+
+
+# ✅ API: Export Excel (แก้เพิ่ม Route และ Clean Header)
+@app.route('/api/export_excel', methods=['POST'])
+def export_excel_api():
+    current_user = request.headers.get('X-Username')
+    
+    log_content = request.json.get('log_content')
+    source_type = request.json.get('source_type')
+    
+    if not log_content: return jsonify({'msg': 'No content'}), 400
+
+    try:
+        # 1. Init Converter
+        converter = ConfigConverter(source_type, "aruba_cx", log_content)
+        
+        # 2. ✅ Clean Header ก่อน Parse (สำคัญ! ไม่งั้น Parse ไม่เจอ)
+        if isinstance(converter.raw_log, str):
+            for header in ["display current-configuration", "show running-config"]:
+                if header in converter.raw_log:
+                    converter.raw_log = converter.raw_log.split(header, 1)[1]
+
+        # 3. Parse ตาม Source Type
+        if source_type == "hp_comware":
+            converter._parse_comware()
+        elif source_type == "cisco_ios":
+            converter._parse_cisco_ios()
+        
+        # 4. Export
+        excel_data = converter.export_to_excel()
+        
+        return send_file(
+            io.BytesIO(excel_data),
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=f"network_spec_{converter.data['hostname']}.xlsx"
+        )
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'msg': str(e)}), 500
+
+
+
+# --- ADMIN USER MANAGEMENT API ---
+@app.route('/api/users', methods=['GET'])
+@token_required
+def get_users(current_user):
+    if users_col is None: return jsonify([]), 500
+    users = list(users_col.find())
+    for u in users:
+        u['_id'] = str(u['_id'])
+        if 'password' in u: del u['password'] 
+    return jsonify(users)
+
+@app.route('/api/users/<id>', methods=['PUT'])
+@token_required
+def update_user(current_user, id):
+    data = request.json
+    update_data = {
+        'role': data.get('role'),
+        'expire_date': data.get('expire_date')
+    }
+    if data.get('password'):
+        update_data['password'] = data['password']
+
+    users_col.update_one({'_id': ObjectId(id)}, {'$set': update_data})
+    return jsonify({'msg': '✅ แก้ไขข้อมูลสำเร็จ'})
+
+@app.route('/api/users/<id>', methods=['DELETE'])
+@token_required
+def delete_user(current_user, id):
+    users_col.delete_one({'_id': ObjectId(id)})
+    return jsonify({'msg': '🗑️ ลบผู้ใช้งานสำเร็จ'})
+
+# --- AUTH ROUTES ---
+
+# ✅ API: จัดการ PROFILES (Sites)
+
+@app.route('/api/profiles', methods=['GET'])
+@token_required
+def get_profiles(current_user):
+    profiles = list(db.profiles.find({'owner': current_user}))
+    for p in profiles:
+        p['_id'] = str(p['_id'])
+    return jsonify(profiles)
+
+@app.route('/api/profiles', methods=['POST'])
+@token_required
+def create_profile(current_user):
+    data = request.json
+    new_profile = {
+        'name': data.get('name'),
+        'owner': current_user,
+        'created_at': dt.datetime.now()
+    }
+    result = db.profiles.insert_one(new_profile)
+    return jsonify({'msg': 'Profile created', 'id': str(result.inserted_id)})
+
+@app.route('/api/profiles/<id>', methods=['PUT'])
+@token_required
+def update_profile(current_user, id):
+    data = request.json
+    db.profiles.update_one(
+        {'_id': ObjectId(id), 'owner': current_user}, 
+        {'$set': {'name': data.get('name')}}
+    )
+    return jsonify({'msg': 'Profile updated'})
+
+@app.route('/api/profiles/<id>', methods=['DELETE'])
+@token_required
+def delete_profile(current_user, id):
+    db.profiles.delete_one({'_id': ObjectId(id), 'owner': current_user})
+    devices_in_profile = list(db.devices.find({'profile_id': id, 'owner': current_user}, {'_id': 1}))
+    device_ids_to_delete = [str(d['_id']) for d in devices_in_profile]
+    if device_ids_to_delete:
+        db.backups.delete_many({'device_id': {'$in': device_ids_to_delete}})
+    db.devices.delete_many({'profile_id': id, 'owner': current_user})
+    return jsonify({'msg': 'Profile deleted'})
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    try:
+        data = request.json
+        username = data.get('username')
+        password = data.get('password')
+
+        if users_col is None:
+            return jsonify({'status': 'error', 'msg': '❌ Database connection failed'}), 500
+
+        user = users_col.find_one({'username': username, 'password': password})
+        
+        if not user:
+            return jsonify({'status': 'error', 'msg': '❌ ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง'}), 401
+
+        # เช็ควันหมดอายุ
+        expire_str = user.get('expire_date') 
+        if expire_str:
+            try:
+                expire_date = dt.datetime.strptime(expire_str, '%Y-%m-%d')
+                if dt.datetime.now() > expire_date:
+                    return jsonify({'status': 'error', 'msg': '⏳ บัญชีของคุณหมดอายุแล้ว กรุณาติดต่อ Admin'}), 403
+            except ValueError:
+                print("Date format error, skipping check")
+
+        # ✅ สร้าง JWT Token
+        token_payload = {
+            'username': user['username'],
+            'role': user.get('role', 'user'),
+            'exp': dt.datetime.utcnow() + dt.timedelta(hours=JWT_EXPIRY_HOURS)
+        }
+        token = jwt.encode(token_payload, JWT_SECRET, algorithm='HS256')
+
+        return jsonify({
+            'status': 'success', 
+            'msg': 'Login Successful',
+            'token': token,
+            'user': {
+                'username': user['username'],
+                'role': user.get('role', 'user'),
+                'expire_date': expire_str
+            }
+        })
+    except Exception as e:
+        print("Login Error:", e)
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'msg': str(e)}), 500
+
+@app.route('/api/admin/create_user', methods=['POST'])
+@token_required
+def create_user(current_user):
+    data = request.json
+    if users_col.find_one({'username': data['username']}):
+        return jsonify({'msg': 'User already exists'}), 400
+        
+    users_col.insert_one({
+        'username': data['username'],
+        'password': data['password'], 
+        'expire_date': data['expire_date'],
+        'role': data.get('role', 'user'),
+        'created_at': dt.datetime.now()
+    })
+    return jsonify({'msg': '✅ User created successfully'})
+
+# --- API ROUTES (ส่วนสำคัญที่ต้องกรอง User) ---
+
+@app.route('/api/devices', methods=['GET'])
+@token_required
+def get_devices(current_user):
+    profile_id = request.args.get('profile_id')
+    if not profile_id: return jsonify([])
+    devices = list(db.devices.find({'owner': current_user, 'profile_id': profile_id}))
+    for dev in devices:
+        dev['_id'] = str(dev['_id'])
+        dev['command_preview'] = get_backup_command(dev['device_type'])
+    return jsonify(devices)
+
+@app.route('/api/devices', methods=['POST'])
+@token_required
+def add_device(current_user):
+    data = request.json
+    if not data.get('profile_id'):
+        return jsonify({'msg': 'Profile ID required'}), 400
+    data['owner'] = current_user 
+    data['created_at'] = dt.datetime.now()
+    db.devices.insert_one(data)
+    return jsonify({'msg': 'Device added successfully'})
+
+@app.route('/api/devices/<id>', methods=['DELETE'])
+@token_required
+def delete_device(current_user, id):
+    result = db.devices.delete_one({'_id': ObjectId(id), 'owner': current_user})
+    if result.deleted_count > 0:
+        return jsonify({'msg': 'Device deleted'})
+    return jsonify({'msg': 'Device not found or permission denied'}), 404
+
+
+
+
+
+
