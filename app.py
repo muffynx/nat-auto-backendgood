@@ -185,11 +185,13 @@ def handle_task_result(data):
             'output': data.get('output', '')
         }, room=owner)
 
-    # 2. กรณีเป็นงาน Command / Config (✅ elif ต้องอยู่ระดับเดียวกับ if ด้านบน)
-    elif task_type in ['run_command', 'push_config', 'batch_config']:
-        # ส่ง event ชื่อ 'terminal_update' กลับไปให้หน้าเว็บ
+    # 2. กรณีเป็นงาน Command / Config ธรรมดา ให้ส่งเข้า Terminal
+    elif task_type in ['run_command', 'push_config']:
         socketio.emit('terminal_update', data)
-    # สามารถเพิ่ม event อื่น ๆ ได้ตามต้องการ
+        
+    # ✅ 3. กรณีเป็น Batch Config ให้แยกส่ง Event ไปหาหน้าต่าง Batch โดยเฉพาะ!
+    elif task_type == 'batch_config':
+        socketio.emit('batch_config_result', data)
 
 
 # ────────────────────────────────────────────────
@@ -219,6 +221,19 @@ def handle_register_agent(data):
 
     emit('agent_auth_success', {'user': user})
     print(f"Agent authenticated and joined room: {user}")
+
+@app.route('/api/download-agent', methods=['GET'])
+def download_agent():
+    """Serve the NetPilot Agent exe for download."""
+    exe_path = os.path.join(os.path.dirname(__file__), 'dist', 'agent_gui.exe')
+    if not os.path.exists(exe_path):
+        return jsonify({'error': 'Agent executable not found on server'}), 404
+    return send_file(
+        exe_path,
+        mimetype='application/octet-stream',
+        as_attachment=True,
+        download_name='NetPilot-Agent.exe'
+    )
 
 @app.route('/api/batch_config', methods=['POST'])
 def api_batch_config():

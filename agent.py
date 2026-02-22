@@ -83,26 +83,58 @@ def task_backup(device):
 
 
 def task_push_config(device, commands):
+    hostname = device.get('hostname', 'unknown')
     try:
+        # 1. ทำความสะอาดคำสั่ง
+        flat_commands = []
+        if isinstance(commands, str):
+            commands = [commands]
+        for cmd in commands:
+            for sub_cmd in str(cmd).split('\n'):
+                if sub_cmd.strip():
+                    flat_commands.append(sub_cmd.strip())
+
+        print(f"[{hostname}] Pushing {len(flat_commands)} commands: {flat_commands}")
+
+        # 2. เชื่อมต่อ
         driver = get_device_driver(device)
         net_connect = ConnectHandler(**driver)
         if device.get('secret'):
             net_connect.enable()
-        output = net_connect.send_config_set(commands)
+
+        # 3. Push config
+        output = net_connect.send_config_set(flat_commands, read_timeout=90)
+
+        # 4. Save config
+        save_output = ''
         save_cmd = None
-        dtype = device['device_type'].lower()
+        dtype = device.get('device_type', '').lower()
         if "cisco" in dtype or "aruba" in dtype:
             save_cmd = "write memory"
         elif "hp" in dtype or "comware" in dtype or "huawei" in dtype:
             save_cmd = "save force"
+
         if save_cmd:
-            output += "\n" + net_connect.send_command(save_cmd, read_timeout=30)
+            save_output = net_connect.send_command(save_cmd, read_timeout=60)
+
         net_connect.disconnect()
-        return {'status': 'Success', 'output': output}
+
+        return {
+            'status': 'Success',
+            'output': output,
+            'save_output': save_output,
+            'commands_applied': flat_commands,   # ← รายการคำสั่งที่ push ไป
+        }
+
     except Exception as e:
-        err = str(e)
         traceback.print_exc()
-        return {'status': 'Failed', 'output': err}
+        return {
+            'status': 'Failed',
+            'output': str(e),
+            'save_output': '',
+            'commands_applied': [],
+        }
+
 
 
 def task_run_command(device, command):
@@ -248,35 +280,72 @@ def on_execute_task(payload):
     # ── 4. BATCH CONFIG ───────────────────────────────────────
     elif task_type == 'batch_config':
         devices = payload.get('devices', [])
-        commands = payload.get('commands', [])
+        commands_raw = payload.get('commands', [])
+
+        # ✅ 1. หั่นข้อความที่คั่นด้วย Enter (\n) ให้กลายเป็น List ของคำสั่ง
+        if isinstance(commands_raw, str):
+            commands = [cmd.strip() for cmd in commands_raw.split('\n') if cmd.strip()]
+        else:
+            commands = commands_raw
 
         if not devices or not commands:
             print("Missing devices or commands in batch_config")
             return
 
         print(f"⚙️ Batch config → {len(devices)} devices")
+        
+        # ✅ 2. เตรียมตัวแปรเก็บผลลัพธ์รวบยอด
+        summary = {'success': 0, 'failed': 0}
+        details = []
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_dev = {executor.submit(task_push_config, dev, commands): dev for dev in devices}
             for future in as_completed(future_to_dev):
                 dev = future_to_dev[future]
                 try:
-                    result = future.result()
-                    sio.emit('task_result', {
-                        'type': 'batch_config',
-                        'status': result['status'],
-                        'output': result['output'],
-                        'hostname': dev.get('hostname'),
-                        'owner': owner
+                    res = future.result()
+                    is_success = res['status'] == 'Success'
+                    applied = res.get('commands_applied', [])
+                    save_out = res.get('save_output', '').strip()
+
+                    if is_success:
+                        summary['success'] += 1
+                    else:
+                        summary['failed'] += 1
+
+                    # สร้าง log ที่อ่านง่าย
+                    if is_success:
+                        cmd_lines = '\n'.join(f'  {i+1}. {c}' for i, c in enumerate(applied))
+                        log = f"Commands Applied ({len(applied)}):\n{cmd_lines}\n"
+                        if save_out:
+                            log += f"\nSave: {save_out[:120]}"
+                    else:
+                        log = res['output']
+
+                    details.append({
+                        'host': dev.get('hostname'),
+                        'ip': dev.get('ip_address', ''),
+                        'status': 'success' if is_success else 'failed',
+                        'commands_applied': applied,
+                        'log': log
                     })
                 except Exception as exc:
-                    sio.emit('task_result', {
-                        'type': 'batch_config',
-                        'status': 'Failed',
-                        'output': str(exc),
-                        'hostname': dev.get('hostname'),
-                        'owner': owner
+                    summary['failed'] += 1
+                    details.append({
+                        'host': dev.get('hostname'),
+                        'ip': dev.get('ip_address', ''),
+                        'status': 'failed',
+                        'commands_applied': [],
+                        'log': str(exc)
                     })
+
+        # ✅ 3. ส่งผลลัพธ์ "ก้อนเดียว" ให้ตรงตามที่ React ต้องการ
+        sio.emit('task_result', {
+            'type': 'batch_config',
+            'summary': summary,
+            'details': details,
+            'owner': owner
+        })
 
     # ── 5. RUN COMMAND เดี่ยว ─────────────────────────────────
     elif task_type == 'run_command':
