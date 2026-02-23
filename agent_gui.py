@@ -54,7 +54,7 @@ def mk_icon(name: str, color: str = "#ffffff", size: tuple = (16, 16)):
 load_dotenv()
 ENV_PATH = os.path.join(os.path.dirname(__file__), '.env')
 
-DEFAULT_URL    = os.getenv('VPS_URL', 'http://192.168.74.1:5000')
+DEFAULT_URL    = os.getenv('VPS_URL', 'http://163.5.9.50:5000')
 DEFAULT_KEY    = os.getenv('AGENT_KEY', '')
 DEFAULT_WORKERS = int(os.getenv('MAX_WORKERS', '10'))
 
