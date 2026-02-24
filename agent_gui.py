@@ -54,7 +54,7 @@ def mk_icon(name: str, color: str = "#ffffff", size: tuple = (16, 16)):
 load_dotenv()
 ENV_PATH = os.path.join(os.path.dirname(__file__), '.env')
 
-DEFAULT_URL    = os.getenv('VPS_URL', 'http://163.5.9.50:5000')
+DEFAULT_URL    = os.getenv('VPS_URL')
 DEFAULT_KEY    = os.getenv('AGENT_KEY', '')
 DEFAULT_WORKERS = int(os.getenv('MAX_WORKERS', '10'))
 
@@ -266,6 +266,23 @@ class AgentThread(threading.Thread):
         elif task_type == 'batch_backup':
             devices = payload.get('devices', [])
             self._log("📦", f"Batch backup  →  {len(devices)} devices")
+
+
+
+            # ✅ 1. ส่งสถานะเริ่มต้น (10% Connecting) กลับไปบอกหน้าเว็บก่อนทันที
+            for d in devices:
+                self.sio.emit('task_result', {
+                    'type': 'backup',
+                    'status': 'Running',
+                    'percent': 10,
+                    'msg': 'Connecting...',
+                    'hostname': d.get('hostname', '?'),
+                    'device_id': d.get('_id'),
+                    'owner': owner
+                })
+
+
+                # ✅ 2. เริ่มเปิด Thread เข้าอุปกรณ์จริงๆ
             with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
                 futures = {ex.submit(task_backup, d): d for d in devices}
                 for fut in as_completed(futures):
@@ -276,6 +293,9 @@ class AgentThread(threading.Thread):
                         status = res['status']
                         icon   = "✅" if status == 'Success' else "❌"
                         self._log(icon, f"  └ {hostname}  →  {status}")
+
+
+
                         self.sio.emit('task_result', {
                             'type': 'backup', 'status': status,
                             'output': res['output'],
@@ -285,6 +305,13 @@ class AgentThread(threading.Thread):
                         })
                     except Exception as exc:
                         self._log("❌", f"  └ {hostname}  →  {exc}")
+                        self.sio.emit('task_result', {
+                            'type': 'backup', 'status': 'Failed',
+                            'output': str(exc),
+                            'hostname': hostname,
+                            'device_id': dev.get('_id'),
+                            'owner': owner
+                        })
 
         # ── BATCH CONFIG ───────────────────────────────
         elif task_type == 'batch_config':

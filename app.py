@@ -160,14 +160,15 @@ def handle_task_result(data):
 
     # 1. กรณีเป็นงาน Backup
     if task_type == 'backup':
-        backup_doc = {
-            'device_id': data.get('device_id'),
-            'hostname': hostname,
-            'owner': owner,
-            'config_data': data.get('output', ''),
-            'status': status,
-            'timestamp': dt.datetime.now(thai_tz),
-        }
+        if status in ['Success', 'Failed']:
+            backup_doc = {
+                'device_id': data.get('device_id'),
+                'hostname': hostname,
+                'owner': owner,
+                'config_data': data.get('output', ''),
+                'status': status,
+                'timestamp': dt.datetime.now(thai_tz),
+            }
         
         if status == 'Failed':
             backup_doc['config_data'] = data.get('output', str(data.get('error', 'Unknown error')))
@@ -247,7 +248,8 @@ def api_batch_config():
     current_user = request.headers.get('X-Username')
     if not current_user:
         return jsonify({'error': 'Unauthorized'}), 401
-
+    if current_user not in agent_connections.values():
+        return jsonify({'status': 'Failed', 'message': 'Agent Offline: กรุณาเปิดโปรแกรม NETPILOT Agent ก่อน'}), 400
     data = request.json
     devices = data.get('devices', [])          # list of device dicts
     commands = data.get('commands', [])
@@ -279,7 +281,8 @@ def run_backup():
 
     # สมมติ frontend ส่ง profile_id มาด้วย หรือดึงทั้งหมดของ user
     profile_id = request.json.get('profile_id')
-
+    if current_user not in agent_connections.values():
+        return jsonify({'status': 'Failed', 'message': 'Agent Offline: กรุณาเปิดโปรแกรม NETPILOT Agent ก่อน'}), 400
     query = {'owner': current_user}
     if profile_id:
         query['profile_id'] = profile_id
