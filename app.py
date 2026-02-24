@@ -25,7 +25,7 @@ CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 thai_tz = timezone(timedelta(hours=7))
-
+agent_connections = {}
 # DATABASE
 MONGO_URI = env.get_env_variable('PYTHON_MONGODB_URI')
 
@@ -218,9 +218,16 @@ def handle_register_agent(data):
 
     # Join room ชื่อ user เพื่อรับ task เฉพาะ
     join_room(user)
-
+    #บันทึกว่า User นี้มี Agent ออนไลน์อยู่
+    agent_connections[request.sid] = user
     emit('agent_auth_success', {'user': user})
     print(f"Agent authenticated and joined room: {user}")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    if request.sid in agent_connections:
+        user = agent_connections.pop(request.sid)
+        print(f"⚠️ Agent disconnected for user: {user}")
 
 @app.route('/api/download-agent', methods=['GET'])
 def download_agent():
@@ -347,6 +354,10 @@ def run_single_command():
     current_user = request.headers.get('X-Username')
     if not current_user:
         return jsonify({'status': 'Failed', 'output': 'Unauthorized'}), 401
+    
+
+    if current_user not in agent_connections.values():
+        return jsonify({'status': 'Failed', 'output': 'Agent Offline: กรุณาเปิดโปรแกรม NATPILOT Agent ที่คอมพิวเตอร์ของคุณก่อนรันคำสั่ง'}), 400
 
     data = request.json
     device_id = data.get('device_id')

@@ -104,6 +104,7 @@ def get_device_driver(device):
         'global_delay_factor': 0.5,
         'fast_cli':    True,
         'banner_timeout': 15,
+        'timeout':        10,
         'auth_timeout':   15,
     }
 
