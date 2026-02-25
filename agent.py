@@ -50,18 +50,58 @@ def get_device_driver(device):
     }
 
 
-def get_backup_command(device_type):
-    """ คำสั่งดึง running-config ตาม vendor """
+def get_backup_commands(device_type):
+    """ คืนค่ารายการคำสั่งดึง config และสถานะการทำงาน (Operational State) ตาม vendor """
     dtype = device_type.lower()
+    
+    # ── Cisco / Aruba (IOS-like) ──
     if "cisco" in dtype or "aruba" in dtype:
-        return "show running-config"
+        return [
+            ("Running Configuration", "show running-config"),
+            ("Version & Uptime", "show version"),
+            ("Interface Status", "show ip interface brief"),
+            ("LLDP Neighbors", "show lldp neighbors detail" if "cisco" not in dtype else "show lldp neighbors"),
+            ("CDP Neighbors", "show cdp neighbors detail"),
+            ("MAC Address Table", "show mac address-table"),
+            ("ARP Table", "show ip arp"),
+            ("Routing Table", "show ip route")
+        ]
+        
+    # ── HP / Comware / Huawei ──
     elif "hp" in dtype or "comware" in dtype or "huawei" in dtype:
-        return "display current-configuration"
+        return [
+            ("Current Configuration", "display current-configuration"),
+            ("Version & Uptime", "display version"),
+            ("Interface Status", "display ip interface brief"),
+            ("LLDP Neighbors", "display lldp neighbor-information verbose"),
+            ("MAC Address Table", "display mac-address"),
+            ("ARP Table", "display arp"),
+            ("Routing Table", "display ip routing-table")
+        ]
+        
+    # ── Juniper ──
     elif "juniper" in dtype:
-        return "show configuration"
+        return [
+            ("Configuration", "show configuration"),
+            ("Version & Uptime", "show version"),
+            ("Interface Status", "show interfaces terse"),
+            ("LLDP Neighbors", "show lldp neighbors"),
+            ("ARP Table", "show arp"),
+            ("Routing Table", "show route")
+        ]
+        
+    # ── Fortinet ──
     elif "fortinet" in dtype:
-        return "show full-configuration"
-    return "show running-config"
+        return [
+            ("Full Configuration", "show full-configuration"),
+            ("System Status", "get system status"),
+            ("Interface Status", "get system interface physical"),
+            ("ARP Table", "get system arp"),
+            ("Routing Table", "get router info routing-table all")
+        ]
+        
+    # ── Default Fallback ──
+    return [("Running Configuration", "show running-config")]
 
 
 # ────────────────────────────────────────────────
@@ -72,10 +112,23 @@ def task_backup(device):
     try:
         driver = get_device_driver(device)
         net_connect = ConnectHandler(**driver)
-        cmd = get_backup_command(device['device_type'])
-        output = net_connect.send_command(cmd, read_timeout=90)
+        
+        commands = get_backup_commands(device['device_type'])
+        full_output = f"=== NETWORK AUDIT BACKUP FOR {device.get('hostname', 'UNKNOWN')} ===\n"
+        full_output += f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        
+        for section_name, cmd in commands:
+            full_output += f"\n{'='*60}\n"
+            full_output += f"👉 {section_name} ({cmd})\n"
+            full_output += f"{'='*60}\n"
+            try:
+                out = net_connect.send_command(cmd, read_timeout=90)
+                full_output += out + "\n"
+            except Exception as e:
+                full_output += f"[Error executing command: {str(e)}]\n"
+                
         net_connect.disconnect()
-        return {'status': 'Success', 'output': output}
+        return {'status': 'Success', 'output': full_output}
     except Exception as e:
         err = str(e)
         traceback.print_exc()

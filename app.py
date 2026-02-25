@@ -160,31 +160,27 @@ def handle_task_result(data):
 
     # 1. กรณีเป็นงาน Backup
     if task_type == 'backup':
+        # ✅ บันทึกลง DB เฉพาะเมื่อเสร็จจริงๆ (Success / Failed) เพื่อหลีกเลี่ยง NameError ตอน status='Running'
         if status in ['Success', 'Failed']:
             backup_doc = {
                 'device_id': data.get('device_id'),
                 'hostname': hostname,
                 'owner': owner,
-                'config_data': data.get('output', ''),
+                'config_data': data.get('output', '') if status == 'Success' else data.get('output', str(data.get('error', 'Unknown error'))),
                 'status': status,
                 'timestamp': dt.datetime.now(thai_tz),
             }
-        
-        if status == 'Failed':
-            backup_doc['config_data'] = data.get('output', str(data.get('error', 'Unknown error')))
+            db.backups.insert_one(backup_doc)
 
-        # บันทึกลง DB
-        db.backups.insert_one(backup_doc)
-
-        # ส่งต่อไป frontend
-        emit('backup_update', {
+        # ✅ ส่งสถานะออก frontend ทุกครั้งไม่ว่าจะ Running / Success / Failed
+        socketio.emit('backup_update', {
             'device_id': data.get('device_id'),
             'hostname': hostname,
             'status': status,
-            'percent': 100 if status in ['Success', 'Failed'] else data.get('percent', 50),
-            'msg': 'Backup Complete' if status == 'Success' else 'Backup Failed',
+            'percent': 100 if status in ['Success', 'Failed'] else data.get('percent', 10),
+            'msg': data.get('msg', 'Backup Complete' if status == 'Success' else ('Backup Failed' if status == 'Failed' else 'Running...')),
             'output': data.get('output', '')
-        }, room=owner)
+        })
 
     # 2. กรณีเป็นงาน Command / Config ธรรมดา ให้ส่งเข้า Terminal
     elif task_type in ['run_command', 'push_config']:
@@ -280,12 +276,21 @@ def run_backup():
         return jsonify({'error': 'Unauthorized'}), 401
 
     # สมมติ frontend ส่ง profile_id มาด้วย หรือดึงทั้งหมดของ user
-    profile_id = request.json.get('profile_id')
+    payload = request.json or {}
+    profile_id = payload.get('profile_id')
+    device_id = payload.get('device_id')
+    device_ids = payload.get('device_ids')  # ✅ รองรับรายการ ID จาก Batch Backup แบบ Selected
+    
     if current_user not in agent_connections.values():
         return jsonify({'status': 'Failed', 'message': 'Agent Offline: กรุณาเปิดโปรแกรม NETPILOT Agent ก่อน'}), 400
+        
     query = {'owner': current_user}
     if profile_id:
         query['profile_id'] = profile_id
+    if device_id:
+        query['_id'] = ObjectId(device_id)
+    if device_ids:
+        query['_id'] = {'$in': [ObjectId(did) for did in device_ids]}
 
     devices = list(db.devices.find(query))
 
