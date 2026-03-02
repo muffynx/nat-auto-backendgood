@@ -607,6 +607,97 @@ def delete_profile(id):
     db.profiles.delete_one({'_id': ObjectId(id), 'owner': current_user})
     return jsonify({'msg': 'Profile deleted'})
 
+
+# ✅ API: FOLDER CRUD (Groups inside a Profile)
+
+@app.route('/api/folders', methods=['GET'])
+def get_folders():
+    current_user = request.headers.get('X-Username')
+    if not current_user:
+        return jsonify([])
+    profile_id = request.args.get('profile_id')
+    query = {'owner': current_user}
+    if profile_id:
+        query['profile_id'] = profile_id
+    folders = list(db.folders.find(query).sort('name', 1))
+    for f in folders:
+        f['_id'] = str(f['_id'])
+    return jsonify(folders)
+
+
+@app.route('/api/folders', methods=['POST'])
+def create_folder():
+    current_user = request.headers.get('X-Username')
+    if not current_user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.json
+    name = data.get('name', '').strip()
+    profile_id = data.get('profile_id')
+    if not name or not profile_id:
+        return jsonify({'error': 'name and profile_id required'}), 400
+    result = db.folders.insert_one({
+        'name': name,
+        'profile_id': profile_id,
+        'owner': current_user,
+        'created_at': dt.datetime.now(thai_tz)
+    })
+    return jsonify({'msg': 'Folder created', 'id': str(result.inserted_id)})
+
+
+@app.route('/api/folders/<id>', methods=['PUT'])
+def rename_folder(id):
+    current_user = request.headers.get('X-Username')
+    if not current_user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.json
+    name = data.get('name', '').strip()
+    if not name:
+        return jsonify({'error': 'name required'}), 400
+    result = db.folders.update_one(
+        {'_id': ObjectId(id), 'owner': current_user},
+        {'$set': {'name': name}}
+    )
+    if result.matched_count > 0:
+        return jsonify({'msg': 'Folder renamed'})
+    return jsonify({'error': 'Folder not found'}), 404
+
+
+@app.route('/api/folders/<id>', methods=['DELETE'])
+def delete_folder(id):
+    current_user = request.headers.get('X-Username')
+    if not current_user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    # Remove folder_id from all devices in this folder
+    db.devices.update_many(
+        {'folder_id': id, 'owner': current_user},
+        {'$unset': {'folder_id': ''}}
+    )
+    result = db.folders.delete_one({'_id': ObjectId(id), 'owner': current_user})
+    if result.deleted_count > 0:
+        return jsonify({'msg': 'Folder deleted'})
+    return jsonify({'error': 'Folder not found'}), 404
+
+
+@app.route('/api/devices/<id>/move', methods=['PUT'])
+def move_device_to_folder(id):
+    """Move a device into a folder (or remove from folder if folder_id is null)"""
+    current_user = request.headers.get('X-Username')
+    if not current_user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.json
+    folder_id = data.get('folder_id')  # null = ungrouped
+    if folder_id:
+        update = {'$set': {'folder_id': folder_id}}
+    else:
+        update = {'$unset': {'folder_id': ''}}
+    result = db.devices.update_one(
+        {'_id': ObjectId(id), 'owner': current_user},
+        update
+    )
+    if result.matched_count > 0:
+        return jsonify({'msg': 'Device moved'})
+    return jsonify({'error': 'Device not found'}), 404
+
 @app.route('/api/login', methods=['POST'])
 def login():
     try:
