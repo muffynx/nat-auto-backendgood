@@ -478,7 +478,14 @@ def convert_config_api():
         converter = ConfigConverter(source_type, target_type, log_content)
         result_config = converter.process()
 
-        return jsonify({'status': 'success', 'output': result_config})
+        interfaces_data = converter.data.get('interfaces', {})
+        
+        # Convert any sets to lists for JSON serialization
+        for port, iface in interfaces_data.items():
+            if 'allowed_vlans' in iface and isinstance(iface['allowed_vlans'], set):
+                iface['allowed_vlans'] = list(iface['allowed_vlans'])
+
+        return jsonify({'status': 'success', 'output': result_config, 'interfaces': interfaces_data})
 
     except Exception as e:
         traceback.print_exc()

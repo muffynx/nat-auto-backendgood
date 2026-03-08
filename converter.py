@@ -344,44 +344,54 @@ class ConfigConverter:
         interfaces = re.findall(r"^interface ([^\n]+)\n(.*?)(?=\n#)", self.raw_log, re.DOTALL | re.MULTILINE)
         for raw_name, cfg in interfaces:
             if "Vlan-interface" in raw_name: continue
-            port = self._map_interface_name(raw_name)
-            if not port: continue
+            
+            # The name might be a range like "1/1/4-1/1/21"
+            # It might also have a type prefix like "GigabitEthernet1/0/1-GigabitEthernet1/0/5"
+            expanded_names = self._expand_raw_interface_range(raw_name)
 
-            iface = self._init_interface_data(cfg)
-            d = re.search(r"description\s+(.+)", cfg)
-            if d: iface["description"] = d.group(1).strip()
+            for single_raw_name in expanded_names:
+                port = self._map_interface_name(single_raw_name)
+                if not port: continue
 
-            # LAG Member
-            m = re.search(r"port link-aggregation group (\d+)", cfg)
-            if m:
-                iface["role"] = "lag_member"
-                iface["lag_id"] = m.group(1)
+                iface = self._init_interface_data(cfg)
+                d = re.search(r"description\s+(.+)", cfg)
+                if d: iface["description"] = d.group(1).strip()
+
+                # LAG Member
+                m = re.search(r"port link-aggregation group (\d+)", cfg)
+                if m:
+                    iface["role"] = "lag_member"
+                    iface["lag_id"] = m.group(1)
+                    self.data["interfaces"][port] = iface
+                    continue
+
+                # Access & Trunk Logic (Comware)
+                m = re.search(r"port access vlan (\d+)", cfg)
+                if m:
+                    iface["role"] = "access"
+                    iface["access_vlan"] = int(m.group(1))
+
+                if "port link-type trunk" in str(cfg):
+                    iface["role"] = "trunk"
+                    m = re.search(r"port trunk pvid vlan (\d+)", cfg)
+                    iface["native_vlan"] = int(m.group(1)) if m else 1
+                    m = re.search(r"port trunk permit vlan (.+)", cfg)
+                    if m: iface["allowed_vlans"] = self._parse_vlan_list(m.group(1))
+
                 self.data["interfaces"][port] = iface
-                continue
-
-            # Access & Trunk Logic (Comware)
-            m = re.search(r"port access vlan (\d+)", cfg)
-            if m:
-                iface["role"] = "access"
-                iface["access_vlan"] = int(m.group(1))
-
-            if "port link-type trunk" in cfg:
-                iface["role"] = "trunk"
-                m = re.search(r"port trunk pvid vlan (\d+)", cfg)
-                iface["native_vlan"] = int(m.group(1)) if m else 1
-                m = re.search(r"port trunk permit vlan (.+)", cfg)
-                if m: iface["allowed_vlans"] = self._parse_vlan_list(m.group(1))
-
-            self.data["interfaces"][port] = iface
 
         # SVI
-        svis = re.findall(r"^interface Vlan-interface(\d+)\n(.*?)(?=\n#)", self.raw_log, re.DOTALL | re.MULTILINE)
+        svis = re.findall(r"^interface Vlan-interface(\d+)\n(.*?)(?=\n#)", self.raw_log or "", re.DOTALL | re.MULTILINE)
         for vid, cfg in svis:
             self._parse_svi_ip(int(vid), cfg)
 
         # Routes
-        routes = re.findall(r"ip route-static (\S+) (\S+) (\S+)", self.raw_log)
-        for d, m, nh in routes: self.data["routes"].append({"dest": d, "mask": m, "next_hop": nh})
+        routes = re.findall(r"ip route-static (\S+) (\S+) (\S+)", self.raw_log or "")
+        for d, m, nh in routes: self.data["routes"].append({"version": "ipv4", "dest": d, "mask": m, "next_hop": nh})
+
+        # IPv6 Routes
+        ipv6_routes = re.findall(r"ipv6 route-static (\S+) (\S+) (\S+)", self.raw_log or "")
+        for d, m, nh in ipv6_routes: self.data["routes"].append({"version": "ipv6", "dest": d, "mask": m, "next_hop": nh})
 
     # ================= PARSER: CISCO IOS (เพิ่มใหม่) =================
     def _parse_cisco_ios(self):
@@ -450,8 +460,17 @@ class ConfigConverter:
             self._parse_svi_ip(int(vid), cfg)
 
         # Routes
-        routes = re.findall(r"^ip route (\S+) (\S+) (\S+)", self.raw_log, re.MULTILINE)
-        for d, m, nh in routes: self.data["routes"].append({"dest": d, "mask": m, "next_hop": nh})
+        routes = re.findall(r"^ip route (\S+) (\S+) (\S+)", self.raw_log or "", re.MULTILINE)
+        for d, m, nh in routes: self.data["routes"].append({"version": "ipv4", "dest": d, "mask": m, "next_hop": nh})
+        
+        # IPv6 Routes
+        ipv6_routes = re.findall(r"^ipv6 route (\S+) (\S+)", self.raw_log or "", re.MULTILINE)
+        for d, nh in ipv6_routes:
+            if "/" in d:
+                dest, mask = d.split("/", 1)
+                self.data["routes"].append({"version": "ipv6", "dest": dest, "mask": mask, "next_hop": nh})
+            else:
+                self.data["routes"].append({"version": "ipv6", "dest": d, "mask": "", "next_hop": nh})
 
     # ================= SHARED HELPERS =================
     def _init_interface_data(self, cfg):
@@ -462,9 +481,9 @@ class ConfigConverter:
         }
 
     def _parse_vlan_list(self, vlan_str):
-        """ แปลง '1,10,20-30' เป็น set {1, 10, 20, 21...} """
+        """ แปลง '1,10,20-30' หรือ '1 10 20-30' เป็น set {1, 10, 20, 21...} """
         vids = set()
-        for part in vlan_str.split(','):
+        for part in vlan_str.replace(',', ' ').split():
             part = part.strip()
             if '-' in part:
                 s, e = map(int, part.split('-'))
@@ -474,7 +493,12 @@ class ConfigConverter:
         return vids
 
     def _parse_svi_ip(self, vid, cfg):
-        self.data["vlans"].setdefault(vid, {"name": f"VLAN_{vid}", "ip": "", "mask": "", "ipv6": ""})
+        self.data["vlans"].setdefault(vid, {"name": f"VLAN_{vid}", "ip": "", "mask": "", "ipv6": "", "description": ""})
+        
+        desc = re.search(r"description\s+(.+)", cfg)
+        if desc:
+            self.data["vlans"][vid]["description"] = desc.group(1).strip()
+            
         m = re.search(r"ip address (\d+\.\d+\.\d+\.\d+) (\d+\.\d+\.\d+\.\d+)", cfg)
         if m:
             self.data["vlans"][vid]["ip"] = m.group(1)
@@ -483,17 +507,69 @@ class ConfigConverter:
         if m6:
             self.data["vlans"][vid]["ipv6"] = m6.group(1)
 
+    # Helper: Expand a raw interface name that might be a range (e.g. "1/1/4-1/1/21" or "GigabitEthernet1/0/4-1/0/21")
+    def _expand_raw_interface_range(self, raw_name):
+        raw_name = raw_name.strip()
+        # If it doesn't look like a range, return as is
+        if "-" not in raw_name or " " in raw_name: # Simple exclude
+            return [raw_name]
+        
+        try:
+            # e.g., "1/1/4-1/1/21" or "Gig1/0/1-Gig1/0/5"
+            parts = raw_name.split('-')
+            if len(parts) == 2:
+                start_p = parts[0].strip()
+                end_p = parts[1].strip()
+
+                # Extract common prefix and number part
+                # Assume pattern like "prefix[number]"
+                m_start = re.match(r"(.*?[\D/])(\d+)$", start_p)
+                m_end = re.match(r"(.*?[\D/])(\d+)$", end_p)
+
+                if m_start and m_end:
+                    # e.g. "1/1/4" -> prefix="1/1/", num="4"
+                    # "GigabitEthernet1/0/1" -> prefix="GigabitEthernet1/0/", num="1"
+                    prefix_start = m_start.group(1)
+                    num_start = int(m_start.group(2))
+                    
+                    prefix_end = m_end.group(1)
+                    num_end = int(m_end.group(2))
+
+                    # The prefixes might be different if the user typed "Gig1/0/1-1/0/5"
+                    # But if the very last number changes, we can generate a range
+                    # Let's assume the prefix of start_p is the base prefix if the end prefix matches or is shorter
+                    # Specifically, if start_p is "1/1/4" and end_p is "1/1/21" -> prefix_start = "1/1/"
+                    
+                    # For safety, if prefixes don't match, we might just fall back to the start prefix
+                    # We will output prefix_start + range(num_start, num_end+1)
+                    if num_end >= num_start and num_end - num_start < 100: # sanity limit 100 ports
+                        expanded = []
+                        for i in range(num_start, num_end + 1):
+                            expanded.append(f"{prefix_start}{i}")
+                        return expanded
+            return [raw_name]
+        except:
+            return [raw_name]
+
     def _map_interface_name(self, name):
         name = name.strip()
         
         # --- HPE Comware ---
-        # Ten-GigabitEthernet1/1/1 -> 1/2/1
-        m = re.match(r"Ten-GigabitEthernet(\d+)/(\d+)/(\d+)", name)
-        if m: return f"{m.group(1)}/{int(m.group(2))+1}/{m.group(3)}"
-        
-        # GigabitEthernet1/0/1 -> 1/1/1
-        m = re.match(r"GigabitEthernet(\d+)/(\d+)/(\d+)", name)
-        if m: return f"{m.group(1)}/{int(m.group(2))+1}/{m.group(3)}"
+        # Ten-GigabitEthernet1/1/1 -> map onto slot 1 (e.g., 1/1/49)
+        m = re.match(r"(?:Ten-)?GigabitEthernet(\d+)/(\d+)/(\d+)", name)
+        if m:
+            member = int(m.group(1))
+            module = int(m.group(2))
+            port = int(m.group(3))
+            
+            # If it's the builtin module (0), keep port number
+            if module == 0:
+                return f"{member}/1/{port}"
+            else:
+                # If it's an expansion module, offset it to end of 48-port block
+                # Module 1 starts at 49, Module 2 starts at 53 (assuming 4 ports per module)
+                target_port = 48 + (module - 1) * 4 + port
+                return f"{member}/1/{target_port}"
 
         # --- Cisco IOS (2960/Catalyst) ---
         # FastEthernet0/1 -> 1/1/1
@@ -504,14 +580,7 @@ class ConfigConverter:
         if m:
             # Cisco Standalone (0/1) or Stack Member (1/0/1)
             # กรณี 0/1 (Stack Member 0 -> 1, Slot 1)
-            member = "1"
-            slot = "1"
             port = m.group(3)
-            
-            # ถ้า Input มาเป็นแบบ Stack (1/0/1) ให้ดึงเลข Member มา
-            # แต่ Regex ข้างบนจับแค่ 2 กลุ่มตัวเลข ดังนั้นสำหรับ Cisco 2960 (Fa0/1)
-            # group(2)=0, group(3)=1
-            
             return f"1/1/{port}" # Map ง่ายๆ ไป Slot 1 หมดก่อน
 
         # LAG
@@ -555,8 +624,9 @@ class ConfigConverter:
         # SVI
         for vid in sorted(self.data["vlans"]):
             v = self.data["vlans"][vid]
-            if v["ip"] or v["ipv6"]:
+            if v["ip"] or v["ipv6"] or v.get("description"):
                 lines.append(f"interface vlan {vid}")
+                if v.get("description"): lines.append(f"    description {v['description']}")
                 if v["ip"]: lines.append(f"    ip address {v['ip']} {v['mask']}")
                 if v["ipv6"]: lines.append(f"    ipv6 address {v['ipv6']}")
                 lines.append("    exit")
@@ -572,56 +642,45 @@ class ConfigConverter:
             lines.append("    no shutdown")
             lines.append("    no routing")
             lines.append("    lacp mode active")
-            lines.append("    vlan trunk native 1") # Default safe
-            lines.append("    vlan trunk allowed all") # Default safe
+            
+            # Check if we parsed specific config for this LAG (e.g., from interface Bridge-Aggregation1)
+            lag_port_name = f"lag{lag_id}"
+            if lag_port_name in self.data["interfaces"]:
+                conf = self.data["interfaces"][lag_port_name]
+                
+                if conf["description"]:
+                    lines.append(f"    description {conf['description']}")
+
+                if conf["role"] == "access":
+                    lines.append(f"    vlan access {conf['access_vlan']}")
+                elif conf["role"] == "trunk":
+                    lines.append(f"    vlan trunk native {conf['native_vlan']}")
+                    allowed = sorted([v for v in conf["allowed_vlans"] if v != conf["native_vlan"]])
+                    if allowed: 
+                        lines.append(f"    vlan trunk allowed {','.join(map(str, allowed))}")
+                    else:
+                        lines.append("    vlan trunk allowed all") # Fallback to all if it says trunk but no specific list
+            else:
+                lines.append("    vlan trunk native 1") # Default safe
+                lines.append("    vlan trunk allowed all") # Default safe
+                
             lines.append("    exit")
             lines.append("#")
 
-        # Physical Ports (Grouping)
+        lines.append("")
+        lines.append("! PHYSICAL_PORTS_START")
+        
+        # Physical Ports (No Grouping)
         phy_ports = [p for p in self.data["interfaces"] if not p.startswith("lag")]
         phy_ports.sort(key=self._iface_sort_key)
 
-        groups = []
-        if phy_ports:
-            current_group = [phy_ports[0]]
-            for i in range(1, len(phy_ports)):
-                prev, curr = phy_ports[i-1], phy_ports[i]
-                prev_conf = self.data["interfaces"][prev]
-                curr_conf = self.data["interfaces"][curr]
-                
-                is_same = (
-                    prev_conf["role"] == curr_conf["role"] and
-                    prev_conf["access_vlan"] == curr_conf["access_vlan"] and
-                    prev_conf["native_vlan"] == curr_conf["native_vlan"] and
-                    prev_conf["allowed_vlans"] == curr_conf["allowed_vlans"] and
-                    prev_conf["lag_id"] == curr_conf["lag_id"] and
-                    prev_conf["shutdown"] == curr_conf["shutdown"]
-                )
-                
-                # Check Consecutive (1/1/1 -> 1/1/2)
-                is_cons = False
-                try:
-                    p = list(map(int, prev.split("/")))
-                    c = list(map(int, curr.split("/")))
-                    if p[0]==c[0] and p[1]==c[1] and c[2]==p[2]+1: is_cons = True
-                except: pass
-
-                if is_same and is_cons: current_group.append(curr)
-                else:
-                    groups.append(current_group)
-                    current_group = [curr]
-            groups.append(current_group)
-
-        for group in groups:
-            if not group: continue
-            first = group[0]
-            conf = self.data["interfaces"][first]
+        for port in phy_ports:
+            conf = self.data["interfaces"][port]
             
-            header = f"interface {group[0]}" if len(group)==1 else f"interface {group[0]}-{group[-1]}"
-            lines.append(header)
+            lines.append(f"interface {port}")
             lines.append("    shutdown" if conf["shutdown"] else "    no shutdown")
             
-            if len(group) == 1 and conf["description"]:
+            if conf["description"]:
                 lines.append(f"    description {conf['description']}")
 
             if conf["role"] == "lag_member":
@@ -636,8 +695,20 @@ class ConfigConverter:
             lines.append("    exit")
             lines.append("#")
 
+        lines.append("! PHYSICAL_PORTS_END")
+        lines.append("")
+
         for r in self.data["routes"]:
-            lines.append(f"ip route {r['dest']} {r['mask']} {r['next_hop']}")
+            v = r.get("version", "ipv4")
+            if v == "ipv4":
+                lines.append(f"ip route {r['dest']} {r['mask']} {r['next_hop']}")
+            elif v == "ipv6":
+                # Comware IPv6 Route: dest=:: mask=0 next_hop=2001:...
+                mask = r['mask']
+                if mask.isdigit():
+                    lines.append(f"ipv6 route {r['dest']}/{mask} {r['next_hop']}")
+                else:
+                    lines.append(f"ipv6 route {r['dest']} {r['mask']} {r['next_hop']}")
 
         lines.append("end")
         lines.append("write memory")
