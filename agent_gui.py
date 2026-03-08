@@ -1,8 +1,4 @@
-"""
-NAT-AUTO Agent GUI
-──────────────────
-ต้องการ: pip install customtkinter pystray pillow python-socketio netmiko python-dotenv
-"""
+
 from typing import Optional
 
 
@@ -27,9 +23,21 @@ except ImportError:
     HAS_TRAY = False
 
 # ─────────────────────────────────────────────
+#   Resource Path Helper for PyInstaller
+# ─────────────────────────────────────────────
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(os.path.dirname(__file__))
+    return os.path.join(base_path, relative_path)
+
+# ─────────────────────────────────────────────
 #   Icon paths
 # ─────────────────────────────────────────────
-ICONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icons', 'png')
+ICONS_DIR = resource_path(os.path.join('icons', 'png'))
 
 def mk_icon(name: str, color: str = "#ffffff", size: tuple = (16, 16)):
     """Load icons/png/<name>.png and tint all opaque pixels to `color`."""
@@ -49,14 +57,40 @@ def mk_icon(name: str, color: str = "#ffffff", size: tuple = (16, 16)):
         return None
 
 # ─────────────────────────────────────────────
-#   Load .env
+#   Load .env & Local Config
 # ─────────────────────────────────────────────
-load_dotenv()
-ENV_PATH = os.path.join(os.path.dirname(__file__), '.env')
+import json
+
+ENV_PATH = resource_path('.env')
+load_dotenv(ENV_PATH)
 
 DEFAULT_URL    = os.getenv('VPS_URL')
-DEFAULT_KEY    = os.getenv('AGENT_KEY', '')
 DEFAULT_WORKERS = int(os.getenv('MAX_WORKERS', '10'))
+
+# Configuration File for storing user-specific tokens
+if getattr(sys, 'frozen', False):
+    CONFIG_PATH = os.path.join(os.path.dirname(sys.executable), 'agent_config.json')
+else:
+    CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'agent_config.json')
+
+def load_local_config():
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_local_config(data):
+    try:
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        print(f"Error saving config: {e}")
+
+local_conf = load_local_config()
+DEFAULT_KEY = local_conf.get('AGENT_KEY', os.getenv('AGENT_KEY', ''))
 
 # ─────────────────────────────────────────────
 #   Colors
@@ -520,7 +554,7 @@ class AgentThread(threading.Thread):
 class AgentApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("NAT-AUTO Agent")
+        self.title("Net-Pilot Agent")
         self.geometry("700x640")
         self.minsize(600, 520)
         self.configure(fg_color=BG)
@@ -536,7 +570,7 @@ class AgentApp(ctk.CTk):
         self.after(200, self._set_window_icon)
 
         if HAS_TRAY:
-            self.protocol("WM_DELETE_WINDOW", self._on_close_to_tray)
+            self.protocol("WM_DELETE_WINDOW", self._quit_app)  # Changed from _on_close_to_tray 
             self._init_tray()
         else:
             self.protocol("WM_DELETE_WINDOW", self.destroy)
@@ -548,13 +582,7 @@ class AgentApp(ctk.CTk):
             import io, tempfile
             from tkinter import PhotoImage
 
-            # หา bundle_dir
-            if getattr(sys, 'frozen', False):
-                bundle_dir = sys._MEIPASS  # type: ignore
-            else:
-                bundle_dir = os.path.dirname(os.path.abspath(__file__))
-
-            logo_path = os.path.join(bundle_dir, 'icons', 'logo.jpg')
+            logo_path = resource_path(os.path.join('icons', 'logo.jpg'))
 
             if os.path.exists(logo_path):
                 img = Image.open(logo_path).convert("RGBA").resize((64, 64))
@@ -595,7 +623,7 @@ class AgentApp(ctk.CTk):
 
         txt_col = ctk.CTkFrame(top, fg_color="transparent")
         txt_col.pack(side="left", pady=8)
-        ctk.CTkLabel(txt_col, text="NAT-AUTO Agent",
+        ctk.CTkLabel(txt_col, text="Net-Pilot Agent",
                       font=(F_BODY, 13, "bold"), text_color=TEXT).pack(anchor="w")
         self._status_label = ctk.CTkLabel(txt_col, text="Offline",
                                            font=F_SMALL, text_color=TEXT_DIM)
@@ -741,12 +769,17 @@ class AgentApp(ctk.CTk):
             self._key_entry.configure(show="*")
             self._show_key_btn.configure(text="👁")
 
-    # ── Save to .env ─────────────────────────
+    # ── Save to Config ─────────────────────────
     def _save_env(self):
         key = self._key_entry.get().strip()
         if key:
-            set_key(ENV_PATH, 'AGENT_KEY', key)
-        self._add_log_row("💾", "Settings saved to .env", color=ACCENT2)
+            # Save to local json file
+            conf = load_local_config()
+            conf['AGENT_KEY'] = key
+            save_local_config(conf)
+            self._add_log_row("💾", "Settings saved to agent_config.json", color=ACCENT2)
+        else:
+            self._add_log_row("❌", "Cannot save config: Agent Token is empty.", color=RED)
 
     # ── Start agent ───────────────────────────
     # ── Settings toggle ────────────────────────
@@ -888,21 +921,28 @@ class AgentApp(ctk.CTk):
     # ── System Tray ───────────────────────────
     def _init_tray(self):
         from PIL import Image, ImageDraw
-        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-        d   = ImageDraw.Draw(img)
-        for r in range(28, 0, -1):
-            ratio = r / 28
-            rc = int(59  + (6   - 59)  * (1 - ratio))
-            gc = int(130 + (182 - 130) * (1 - ratio))
-            bc = int(246 + (212 - 246) * (1 - ratio))
-            d.ellipse([32-r, 32-r, 32+r, 32+r], fill=(rc, gc, bc, 255))
-        d.text((21, 16), "A", fill="white")
+        import os
+        
+        logo_path = resource_path(os.path.join('icons', 'logo.jpg'))
+        if os.path.exists(logo_path):
+            img = Image.open(logo_path).convert("RGBA").resize((64, 64))
+        else:
+            img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            d   = ImageDraw.Draw(img)
+            for r in range(28, 0, -1):
+                ratio = r / 28
+                rc = int(59  + (6   - 59)  * (1 - ratio))
+                gc = int(130 + (182 - 130) * (1 - ratio))
+                bc = int(246 + (212 - 246) * (1 - ratio))
+                d.ellipse([32-r, 32-r, 32+r, 32+r], fill=(rc, gc, bc, 255))
+            d.text((21, 16), "N", fill="white")
+            
         menu = pystray.Menu(
             pystray.MenuItem("Show", self._show_window, default=True),
             pystray.MenuItem("Stop Agent", lambda _: self._stop_agent()),
             pystray.MenuItem("Quit", lambda _: self._quit_app()),
         )
-        self._tray = pystray.Icon("nat-auto-agent", img, "NAT-AUTO Agent", menu)
+        self._tray = pystray.Icon("net-pilot-agent", img, "Net-Pilot Agent", menu)
         threading.Thread(target=self._tray.run, daemon=True).start()
 
     def _on_close_to_tray(self):

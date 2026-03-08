@@ -2,10 +2,10 @@
 
 
 a = Analysis(
-    ['F:\\project-net\\nat-auto-backend-main\\nat-auto-backend-main\\agent_gui.py'],
+    ['agent_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('F:\\project-net\\nat-auto-backend-main\\nat-auto-backend-main\\icons', 'icons')],
+    datas=[('icons', 'icons/'), ('.env', '.'), ('*.png', '.'), ('*.jpg', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['F:\\project-net\\nat-auto-backend-main\\nat-auto-backend-main\\icons\\icons.ico'],
+    icon=['icons\\logo.jpg'],
 )
