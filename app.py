@@ -11,6 +11,9 @@ import certifi
 import traceback
 import io
 import os
+import zipfile
+import pandas as pd
+from werkzeug.utils import secure_filename
 from datetime import datetime, timezone, timedelta
 import secrets  # สำหรับ gen key
 
@@ -37,6 +40,10 @@ try:
     client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
     db = client['net_automation']
     users_col = db['users']
+    
+    # Create TTL Index on batch_reports run_date to auto-expire after 7 days
+    db.batch_reports.create_index("run_date", expireAfterSeconds=604800)
+    
     print("✅ Connected to MongoDB Atlas")
 except Exception as e:
     print(f"❌ MongoDB Connection Error: {e}")
@@ -188,6 +195,22 @@ def handle_task_result(data):
         
     # ✅ 3. กรณีเป็น Batch Config ให้แยกส่ง Event ไปหาหน้าต่าง Batch โดยเฉพาะ!
     elif task_type == 'batch_config':
+        # บันทึกประวัติการรันลงฐานข้อมูล `batch_reports`
+        profile_id = data.get('profile_id')
+        summary = data.get('summary', {})
+        
+        # We only save if there was at least one execution task
+        if profile_id and (summary.get('success', 0) > 0 or summary.get('failed', 0) > 0):
+            report_doc = {
+                'profile_id': profile_id,
+                'owner': owner,
+                'run_date': dt.datetime.now(thai_tz),
+                'task_type': task_type,
+                'summary': summary,
+                'details': data.get('details', [])
+            }
+            db.batch_reports.insert_one(report_doc)
+            
         socketio.emit('batch_config_result', data)
 
 
@@ -356,6 +379,174 @@ def config_vlan_ip():
         'preview': config_lines[:10]  # แสดงตัวอย่าง
     })
 
+
+@app.route('/api/batch_config_zip', methods=['POST'])
+def batch_config_zip():
+    current_user = request.headers.get('X-Username')
+    if not current_user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    if current_user not in agent_connections.values():
+        return jsonify({'error': 'Agent Offline: กรุณาเปิดโปรแกรม NATPILOT Agent ที่คอมพิวเตอร์ของคุณก่อน'}), 400
+
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+
+    if not file.filename.endswith('.zip'):
+        return jsonify({'error': 'File must be a .zip file'}), 400
+
+    profile_id = request.form.get('profile_id')
+
+    try:
+        # Read zip file into memory
+        with zipfile.ZipFile(file, 'r') as zip_ref:
+            filenames = zip_ref.namelist()
+            
+            # Find the excel file
+            excel_filename = None
+            for fn in filenames:
+                if fn.endswith('.xlsx') or fn.endswith('.xls'):
+                    if not fn.startswith('__MACOSX'):  # ignore mac osx hidden files
+                        excel_filename = fn
+                        break
+            
+            if not excel_filename:
+                return jsonify({'error': 'No Excel file (.xlsx or .xls) found inside the zip'}), 400
+
+            # Read the excel file
+            with zip_ref.open(excel_filename) as excel_file:
+                df = pd.read_excel(excel_file)
+            
+            # Ensure columns exist (case-insensitive for convenience)
+            df.columns = df.columns.str.lower().str.strip()
+            
+            required_cols = ['ip address', 'filename']
+            for col in required_cols:
+                if col not in df.columns and col.replace(' ', '_') not in df.columns:
+                    return jsonify({'error': f'Excel file is missing required column: {col}'}), 400
+            
+            # Fallback mappings for columns
+            ip_col = 'ip address' if 'ip address' in df.columns else 'ip_address'
+            user_col = 'username' if 'username' in df.columns else None
+            pass_col = 'password' if 'password' in df.columns else None
+            file_col = 'filename'
+            type_col = 'device type' if 'device type' in df.columns else 'device_type' if 'device_type' in df.columns else 'vendor' if 'vendor' in df.columns else None
+            port_col = 'port' if 'port' in df.columns else None
+            
+            dispatched_count = 0
+            errors = []
+            tasks = []
+
+            for index, row in df.iterrows():
+                ip_addr = str(row[ip_col]).strip() if pd.notna(row[ip_col]) else None
+                txt_filename = str(row[file_col]).strip() if pd.notna(row[file_col]) else None
+                
+                if not ip_addr or not txt_filename:
+                    continue
+                
+                # Look for the txt file in zip (handle possible subdirectories inside zip)
+                txt_file_path = None
+                for fn in filenames:
+                    # Ignore macos metadata files safely
+                    if fn.endswith(txt_filename) and not fn.startswith('__MACOSX'):
+                        txt_file_path = fn
+                        break
+                
+                if not txt_file_path:
+                    errors.append(f"Config file '{txt_filename}' for IP {ip_addr} not found in zip.")
+                    continue
+                
+                # Read config commands
+                with zip_ref.open(txt_file_path) as txt_file:
+                    text_content = txt_file.read().decode('utf-8', errors='ignore')
+                    commands = [line.strip() for line in text_content.splitlines() if line.strip()]
+                
+                if not commands:
+                    errors.append(f"Config file '{txt_filename}' is empty.")
+                    continue
+
+                # Prepare device dict
+                device = {
+                    'ip_address': ip_addr,
+                    'device_type': str(row[type_col]).strip() if type_col and pd.notna(row[type_col]) else 'cisco_ios',
+                    'username': str(row[user_col]).strip() if user_col and pd.notna(row[user_col]) else '',
+                    'password': str(row[pass_col]).strip() if pass_col and pd.notna(row[pass_col]) else '',
+                    'port': int(row[port_col]) if port_col and pd.notna(row[port_col]) else 22,
+                    # Provide a generic hostname so agent doesn't throw errors
+                    'hostname': f'Batch-{ip_addr}'
+                }
+
+                tasks.append({'device': device, 'commands': commands})
+                dispatched_count += 1
+            
+            # Dispatch directly to agent as ONE batch task
+            if tasks:
+                socketio.emit('execute_task', {
+                    'type': 'batch_config_zip',  # Important: trigger zip-specific batch flow
+                    'tasks': tasks,
+                    'owner': current_user,
+                    'profile_id': profile_id
+                })
+
+            return jsonify({
+                'status': 'success',
+                'dispatched': dispatched_count,
+                'errors': errors,
+                'message': f'Successfully dispatched {dispatched_count} device configs.'
+            })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/batch_reports', methods=['GET'])
+def get_batch_reports():
+    current_user = request.headers.get('X-Username')
+    profile_id = request.args.get('profile_id')
+    
+    if not current_user or not profile_id:
+        return jsonify({'error': 'Unauthorized or Missing profile_id'}), 400
+        
+    # ค้นหา Batch Reports ทั้งหมดของหน้านี้, ไม่โหลด details มาเพื่อประหยัด bandwidth
+    reports = list(db.batch_reports.find(
+        {'owner': current_user, 'profile_id': profile_id},
+        {'details': 0}  # Exclude heavy logs array 
+    ).sort('run_date', -1).limit(50)) # โหลดล่าสุด 50 รอบ
+    
+    for r in reports:
+        r['_id'] = str(r['_id'])
+        
+    return jsonify(reports)
+
+@app.route('/api/batch_reports/<report_id>', methods=['GET'])
+def get_batch_report_details(report_id):
+    current_user = request.headers.get('X-Username')
+    if not current_user:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    report = db.batch_reports.find_one({'_id': ObjectId(report_id), 'owner': current_user})
+    if not report:
+        return jsonify({'error': 'Report not found'}), 404
+        
+    report['_id'] = str(report['_id'])
+    return jsonify(report)
+
+@app.route('/api/batch_reports/<report_id>', methods=['DELETE'])
+def delete_batch_report(report_id):
+    current_user = request.headers.get('X-Username')
+    if not current_user:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    result = db.batch_reports.delete_one({'_id': ObjectId(report_id), 'owner': current_user})
+    if result.deleted_count == 1:
+        return jsonify({'status': 'success', 'msg': 'Report deleted successfully'})
+    else:
+        return jsonify({'error': 'Report not found or not authorized'}), 404
 
 @app.route('/api/run_single_command', methods=['POST'])
 def run_single_command():

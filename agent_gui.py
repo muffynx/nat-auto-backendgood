@@ -373,6 +373,7 @@ class AgentThread(threading.Thread):
         elif task_type == 'batch_config':
             devices  = payload.get('devices', [])
             raw_cmds = payload.get('commands', [])
+            profile_id = payload.get('profile_id', '')
             if isinstance(raw_cmds, str):
                 commands = [c.strip() for c in raw_cmds.split('\n') if c.strip()]
             else:
@@ -419,9 +420,62 @@ class AgentThread(threading.Thread):
                 'type': 'batch_config',
                 'summary': summary,
                 'details': details,
-                'owner': owner
+                'owner': owner,
+                'profile_id': profile_id
             })
             self._log("📊", f"Batch done  ✅ {summary['success']}  ❌ {summary['failed']}")
+
+        # ── BATCH CONFIG ZIP ───────────────────────────────
+        elif task_type == 'batch_config_zip':
+            tasks = payload.get('tasks', [])  # list of dicts: {'device': dev, 'commands': cmds}
+            profile_id = payload.get('profile_id', '')
+            self._log("⚙️", f"Batch ZIP config  →  {len(tasks)} devices")
+
+            summary = {'success': 0, 'failed': 0}
+            details = []
+            with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+                futures = {ex.submit(task_push_config, t['device'], t['commands']): t for t in tasks}
+                for fut in as_completed(futures):
+                    t        = futures[fut]
+                    dev      = t['device']
+                    hostname = dev.get('hostname', '?')
+                    try:
+                        res        = fut.result()
+                        is_success = res['status'] == 'Success'
+                        applied    = res.get('commands_applied', [])
+                        save_out   = res.get('save_output', '').strip()
+                        icon       = "✅" if is_success else "❌"
+                        self._log(icon, f"  └ {hostname}  →  {res['status']}")
+                        if is_success:
+                            summary['success'] += 1
+                            cmd_lines = '\n'.join(f'  {i+1}. {c}' for i, c in enumerate(applied))
+                            log = f"Commands Applied ({len(applied)}):\n{cmd_lines}"
+                            if save_out:
+                                log += f"\nSave: {save_out[:120]}"
+                        else:
+                            summary['failed'] += 1
+                            log = res['output']
+                        details.append({
+                            'host': hostname,
+                            'ip': dev.get('ip_address', ''),
+                            'status': 'success' if is_success else 'failed',
+                            'commands_applied': applied,
+                            'log': log
+                        })
+                    except Exception as exc:
+                        summary['failed'] += 1
+                        details.append({'host': hostname, 'ip': dev.get('ip_address', ''),
+                                        'status': 'failed', 'commands_applied': [],
+                                        'log': str(exc)})
+
+            self.sio.emit('task_result', {
+                'type': 'batch_config',  # Output type matches existing frontend expected format
+                'summary': summary,
+                'details': details,
+                'owner': owner,
+                'profile_id': profile_id
+            })
+            self._log("📊", f"Batch ZIP done  ✅ {summary['success']}  ❌ {summary['failed']}")
 
         # ── RUN COMMAND ────────────────────────────────
         elif task_type == 'run_command':
