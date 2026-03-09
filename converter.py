@@ -22,7 +22,12 @@ class ConfigConverter:
             "routes": [],       # static routes
             "interfaces": {},   # port -> role data
             "dhcp_pools": [],   # list of { name, network, mask, gateway, dns }
-            "dhcp_relays": []   # list of { interface, helper_ips: [] }
+            "dhcp_relays": [],  # list of { interface, helper_ips: [] }
+            "ntp_servers": [],  # list of strings (IPs)
+            "aaa_commands": [], # list of plain aaa strings
+            "radius_servers": [], # list of { ip, key }
+            "tacacs_servers": [],  # list of { ip, key }
+            "snmp_commands": []   # list of bare snmp commands
         }
 
     # ================= MAIN =================
@@ -541,6 +546,45 @@ class ConfigConverter:
         ipv6_routes = re.findall(r"ipv6 route-static (\S+) (\S+) (\S+)", self.raw_log or "")
         for d, m, nh in ipv6_routes: self.data["routes"].append({"version": "ipv6", "dest": d, "mask": m, "next_hop": nh})
 
+        # Global NTP (Comware often uses ntp-service unicast-server or ntp server)
+        ntp_servers = re.findall(r"ntp(?:-service unicast-)?server\s+(\S+)", self.raw_log or "", re.IGNORECASE)
+        for srv in ntp_servers:
+            if srv not in self.data["ntp_servers"]:
+                self.data["ntp_servers"].append(srv)
+
+        # Global AAA commands (Comware)
+        aaa_cmds = re.findall(r"^(aaa (?:authentication|authorization|accounting).*?)(?=\n)", self.raw_log or "", re.MULTILINE)
+        for cmd in aaa_cmds:
+            # We strip trailing 'local' if it exists just to maintain a cleaner normalized state, but let's keep it exact for now
+            self.data["aaa_commands"].append(cmd.strip())
+
+        # Global TACACS (Comware)
+        tacacs_hosts = re.findall(r"^tacacs-server host\s+(\S+)", self.raw_log or "", re.MULTILINE)
+        tacacs_keys = re.findall(r"^tacacs-server key\n([^\n]+)", self.raw_log or "", re.MULTILINE)
+        # Often keys are on the next line or inline
+        inline_keys = re.findall(r"^tacacs-server host\s+\S+\s+key (?:cipher |simple |)(\S+)", self.raw_log or "", re.MULTILINE)
+        
+        # Combine logic simply: if we find hosts, and we find a discrete key below it, associate them, else use inline
+        for host in tacacs_hosts:
+            key = tacacs_keys[0].strip() if tacacs_keys else (inline_keys[0].strip() if inline_keys else "")
+            self.data["tacacs_servers"].append({"ip": host, "key": key})
+
+        # Global RADIUS (Comware) -> radius scheme X -> primary authentication IP -> key
+        radius_blocks = re.findall(r"^radius scheme (.*?)\n(.*?)(?=^radius scheme |^#|^!)", self.raw_log or "", re.DOTALL | re.MULTILINE)
+        for name, block in radius_blocks:
+            host_m = re.search(r"primary authentication\s+(\S+)", block)
+            key_m = re.search(r"key authentication\s+(?:cipher |simple |)(\S+)", block)
+            if host_m:
+                self.data["radius_servers"].append({
+                    "ip": host_m.group(1).strip(),
+                    "key": key_m.group(1).strip() if key_m else ""
+                })
+
+        # SNMP (Comware)
+        snmp_cmds = re.findall(r"^(snmp-agent.*?)(?=\n)", self.raw_log or "", re.MULTILINE)
+        for cmd in snmp_cmds:
+            self.data["snmp_commands"].append(cmd.strip())
+
     # ================= PARSER: CISCO IOS (เพิ่มใหม่) =================
     def _parse_cisco_ios(self):
         # Hostname
@@ -654,6 +698,39 @@ class ConfigConverter:
                 self.data["routes"].append({"version": "ipv6", "dest": dest, "mask": mask, "next_hop": nh})
             else:
                 self.data["routes"].append({"version": "ipv6", "dest": d, "mask": "", "next_hop": nh})
+
+        # Global NTP (Cisco)
+        ntp_servers = re.findall(r"^ntp server\s+(\S+)", self.raw_log or "", re.MULTILINE)
+        for srv in ntp_servers:
+            if srv not in self.data["ntp_servers"]:
+                self.data["ntp_servers"].append(srv)
+
+        # Global AAA commands (Cisco)
+        aaa_cmds = re.findall(r"^(aaa (?:new-model|authentication|authorization|accounting).*?)(?=\n)", self.raw_log or "", re.MULTILINE)
+        for cmd in aaa_cmds:
+            self.data["aaa_commands"].append(cmd.strip())
+
+        # Global TACACS (Cisco legacy & modern)
+        # legacy: tacacs-server host X key Y
+        # modern: tacacs server NAME \n address ipv4 X \n key Y
+        legacy_tacacs = re.findall(r"^tacacs-server host\s+(\S+)(?:\s+key\s+(\S+))?", self.raw_log or "", re.MULTILINE)
+        for ip, key in legacy_tacacs:
+            self.data["tacacs_servers"].append({"ip": ip, "key": key if key else ""})
+
+        modern_tacacs = re.findall(r"^tacacs server \S+\n(.*?)address ipv4 (\S+)(.*?)(?=^!|^tacacs server|\Z)", self.raw_log or "", re.DOTALL | re.MULTILINE)
+        for pre, ip, post in modern_tacacs:
+            key_m = re.search(r"key\s+(\S+)", pre + post)
+            self.data["tacacs_servers"].append({"ip": ip, "key": key_m.group(1) if key_m else ""})
+
+        # Global RADIUS (Cisco)
+        legacy_radius = re.findall(r"^radius-server host\s+(\S+)(?:\s+auth-port.*?)?(?:\s+key\s+(\S+))?", self.raw_log or "", re.MULTILINE)
+        for ip, key in legacy_radius:
+            self.data["radius_servers"].append({"ip": ip, "key": key if key else ""})
+
+        # SNMP (Cisco)
+        snmp_cmds = re.findall(r"^(snmp-server.*?)(?=\n)", self.raw_log or "", re.MULTILINE)
+        for cmd in snmp_cmds:
+            self.data["snmp_commands"].append(cmd.strip())
 
     # ================= SHARED HELPERS =================
     def _init_interface_data(self, cfg):
@@ -795,6 +872,44 @@ class ConfigConverter:
             lines.append(self.data["banner"])
             lines.append("#")
         lines.append("#")
+
+        # NTP
+        for srv in self.data.get("ntp_servers", []):
+            lines.append(f"ntp server {srv}")
+        if self.data.get("ntp_servers"):
+            lines.append("ntp enable")
+            lines.append("#")
+
+        # AAA, TACACS, RADIUS (Put AAA stuff early before interfaces)
+        tacacs = self.data.get("tacacs_servers", [])
+        if tacacs:
+            for t in tacacs:
+                if t["key"]:
+                    lines.append(f"tacacs-server host {t['ip']} key plaintext {t['key']}")
+                else:
+                    lines.append(f"tacacs-server host {t['ip']}")
+            lines.append("#")
+
+        radius = self.data.get("radius_servers", [])
+        if radius:
+            for r in radius:
+                if r["key"]:
+                    lines.append(f"radius-server host {r['ip']} key plaintext {r['key']}")
+                else:
+                    lines.append(f"radius-server host {r['ip']}")
+            lines.append("#")
+
+        # Dump raw AAA strings (they vary heavily, best effort is just appending them pre-interfaces)
+        for cmd in self.data.get("aaa_commands", []):
+            lines.append(cmd)
+        if self.data.get("aaa_commands"):
+            lines.append("#")
+
+        # Dump raw SNMP commands (Comware snmp-agent or Cisco snmp-server)
+        for cmd in self.data.get("snmp_commands", []):
+            lines.append(cmd)
+        if self.data.get("snmp_commands"):
+            lines.append("#")
 
         # VLANs
         for vid in sorted(self.data["vlans"]):
