@@ -20,7 +20,9 @@ class ConfigConverter:
             "banner": "",
             "vlans": {},        # vid -> { name, ip, mask, ipv6 }
             "routes": [],       # static routes
-            "interfaces": {}    # port -> role data
+            "interfaces": {},   # port -> role data
+            "dhcp_pools": [],   # list of { name, network, mask, gateway, dns }
+            "dhcp_relays": []   # list of { interface, helper_ips: [] }
         }
 
     # ================= MAIN =================
@@ -116,13 +118,35 @@ class ConfigConverter:
 
         # 4. Sheet: Routes
         route_list = []
-        for r in self.data['routes']:
+        for r in self.data.get('routes', []):
             route_list.append({
                 'Destination': r['dest'],
                 'Mask': r['mask'],
                 'Next_Hop': r['next_hop']
             })
         pd.DataFrame(route_list).to_excel(writer, sheet_name='Routes', index=False)
+
+        # 5. Sheet: DHCP Pools 🆕
+        pool_list = []
+        for p in self.data.get('dhcp_pools', []):
+            pool_list.append({
+                'Name': p['name'],
+                'Network': p['network'],
+                'Mask': p['mask'],
+                'Gateway': p['gateway'],
+                'DNS': p['dns']
+            })
+        pd.DataFrame(pool_list).to_excel(writer, sheet_name='DHCP Pools', index=False)
+
+        # 6. Sheet: DHCP Relays 🆕
+        relay_list = []
+        for r in self.data.get('dhcp_relays', []):
+            relay_list.append({
+                'Interface': r['interface'],
+                'Helper_IPs': ", ".join(r['helper_ips'])
+            })
+        pd.DataFrame(relay_list).to_excel(writer, sheet_name='DHCP Relays', index=False)
+
         workbook  = writer.book
         worksheet = writer.sheets['Interfaces']
 
@@ -191,11 +215,12 @@ class ConfigConverter:
         # ------------------------
         # Auto Filter
         # ------------------------
-        worksheet.autofilter(
-            0, 0,
-            len(iface_list),
-            len(iface_list[0]) - 1
-        )
+        if iface_list:
+            worksheet.autofilter(
+                0, 0,
+                len(iface_list),
+                len(iface_list[0]) - 1
+            )
 
         # ------------------------
         # Row formatting by Role
@@ -251,7 +276,91 @@ class ConfigConverter:
                         "mask": str(row['Mask']),
                         "ipv6": str(row['IPv6'])
                     }
-                except: continue
+                except:
+                    pass
+
+        # 3. Sheet: Interfaces
+        if 'Interfaces' in xls.sheet_names:
+            df_iface = pd.read_excel(xls, 'Interfaces').fillna('')
+            for _, row in df_iface.iterrows():
+                port_name = str(row['Port']).strip()
+                if not port_name: continue
+                
+                # แปลงรหัสพอร์ตให้ได้ standard format
+                port = self._map_interface_name(port_name)
+                if not port:
+                    port = port_name # fallback
+
+                iface = self._init_interface_data("")
+                iface["description"] = str(row['Description']).strip()
+                
+                role = str(row['Role']).strip().lower()
+                if role in ("access", "trunk", "lag_member"):
+                    iface["role"] = role
+
+                if iface["role"] == "access" and row['Access_VLAN']:
+                    try: iface["access_vlan"] = int(row['Access_VLAN'])
+                    except: pass
+                
+                if iface["role"] == "trunk" and row['Native_VLAN']:
+                    try: iface["native_vlan"] = int(row['Native_VLAN'])
+                    except: pass
+                
+                if row['Allowed_VLANs']:
+                    iface["allowed_vlans"] = self._parse_vlan_list(str(row['Allowed_VLANs']))
+                
+                if row['LAG_ID']:
+                    iface["lag_id"] = str(row['LAG_ID'])
+                
+                if str(row['Shutdown']).strip().lower() == 'yes':
+                    iface["shutdown"] = True
+                
+                # Handle OSPF Cost if exists
+                if 'OSPF_Cost' in row and row['OSPF_Cost']:
+                    try: iface["ospf_cost"] = int(row['OSPF_Cost'])
+                    except: pass
+                    
+                self.data["interfaces"][port] = iface
+
+        # 4. Sheet: Routes
+        if 'Routes' in xls.sheet_names:
+            df_routes = pd.read_excel(xls, 'Routes').fillna('')
+            for _, row in df_routes.iterrows():
+                dest = str(row['Destination']).strip()
+                if dest:
+                    self.data["routes"].append({
+                        "version": "ipv4",
+                        "dest": dest,
+                        "mask": str(row['Mask']).strip(),
+                        "next_hop": str(row['Next_Hop']).strip()
+                    })
+
+        # 5. Sheet: DHCP Pools 🆕
+        if 'DHCP Pools' in xls.sheet_names:
+            df_pools = pd.read_excel(xls, 'DHCP Pools').fillna('')
+            for _, row in df_pools.iterrows():
+                pool_name = str(row['Name']).strip()
+                if pool_name:
+                    self.data["dhcp_pools"].append({
+                        "name": pool_name,
+                        "network": str(row['Network']).strip(),
+                        "mask": str(row['Mask']).strip(),
+                        "gateway": str(row['Gateway']).strip(),
+                        "dns": str(row['DNS']).strip()
+                    })
+
+        # 6. Sheet: DHCP Relays 🆕
+        if 'DHCP Relays' in xls.sheet_names:
+            df_relays = pd.read_excel(xls, 'DHCP Relays').fillna('')
+            for _, row in df_relays.iterrows():
+                interface = str(row['Interface']).strip()
+                if interface:
+                    helpers_str = str(row['Helper_IPs']).strip()
+                    helpers = [h.strip() for h in helpers_str.split(',')] if helpers_str else []
+                    self.data["dhcp_relays"].append({
+                        "interface": interface,
+                        "helper_ips": helpers
+                    })
 
         # 3. Sheet: Interfaces
         if 'Interfaces' in xls.sheet_names:
@@ -380,10 +489,49 @@ class ConfigConverter:
 
                 self.data["interfaces"][port] = iface
 
-        # SVI
+        # DHCP Pools (Comware)
+        dhcp_pools = re.findall(r"^dhcp server ip-pool (\S+)\n(.*?)(?=^#|^dhcp server ip-pool)", self.raw_log, re.DOTALL | re.MULTILINE)
+        for pool_name, pool_cfg in dhcp_pools:
+            pool_data = {
+                "name": pool_name,
+                "network": "",
+                "mask": "",
+                "gateway": "",
+                "dns": ""
+            }
+            n = re.search(r"network\s+(\S+)\s+mask\s+(\S+)", pool_cfg)
+            if n:
+                pool_data["network"] = n.group(1)
+                pool_data["mask"] = n.group(2)
+            
+            g = re.search(r"gateway-list\s+(.*)", pool_cfg)
+            if g: pool_data["gateway"] = g.group(1).strip()
+            
+            d = re.search(r"dns-list\s+(.*)", pool_cfg)
+            if d: pool_data["dns"] = d.group(1).strip()
+            
+            self.data["dhcp_pools"].append(pool_data)
+
+        # DHCP Relays (Comware) - Check routed ports first
+        for raw_name, cfg in interfaces:
+            # Match dhcp relay server-address <IP> or dhcp server apply ip-pool
+            helpers = re.findall(r"dhcp relay server-address\s+(\S+)", cfg)
+            if helpers:
+                self.data["dhcp_relays"].append({
+                    "interface": raw_name.strip(),
+                    "helper_ips": helpers
+                })
+
+        # SVI & Helper Address for SVI (Comware)
         svis = re.findall(r"^interface Vlan-interface(\d+)\n(.*?)(?=\n#)", self.raw_log or "", re.DOTALL | re.MULTILINE)
         for vid, cfg in svis:
             self._parse_svi_ip(int(vid), cfg)
+            helpers = re.findall(r"dhcp relay server-address\s+(\S+)", cfg)
+            if helpers:
+                self.data["dhcp_relays"].append({
+                    "interface": f"Vlan-interface{vid}",
+                    "helper_ips": helpers
+                })
 
         # Routes
         routes = re.findall(r"ip route-static (\S+) (\S+) (\S+)", self.raw_log or "")
@@ -451,14 +599,49 @@ class ConfigConverter:
                 
                 m = re.search(r"switchport trunk allowed vlan ([\d,-]+)", cfg)
                 if m: iface["allowed_vlans"] = self._parse_vlan_list(m.group(1))
+            # OSPF Cost
+            m = re.search(r"ip ospf cost (\d+)", cfg)
+            if m: iface["ospf_cost"] = int(m.group(1))
 
             self.data["interfaces"][port] = iface
 
-        # SVI (Interface Vlan)
+        # DHCP Pools (Cisco)
+        dhcp_pools = re.findall(r"^ip dhcp pool (\S+)\n(.*?)(?=^!|^ip dhcp pool)", self.raw_log, re.DOTALL | re.MULTILINE)
+        for pool_name, pool_cfg in dhcp_pools:
+            pool_data = {
+                "name": pool_name,
+                "network": "",
+                "mask": "",
+                "gateway": "",
+                "dns": ""
+            }
+            n = re.search(r"network\s+(\S+)\s+(\S+)", pool_cfg)
+            if n:
+                pool_data["network"] = n.group(1)
+                pool_data["mask"] = n.group(2)
+            
+            g = re.search(r"default-router\s+(.*)", pool_cfg)
+            if g: pool_data["gateway"] = g.group(1).strip()
+            
+            d = re.search(r"dns-server\s+(.*)", pool_cfg)
+            if d: pool_data["dns"] = d.group(1).strip()
+            
+            self.data["dhcp_pools"].append(pool_data)
+
+        # IP Helper Address / DHCP Relays (Cisco)
+        # Search through already matched interfaces string
+        for raw_name, cfg in interfaces:
+            helpers = re.findall(r"ip helper-address\s+(\S+)", cfg)
+            if helpers:
+                self.data["dhcp_relays"].append({
+                    "interface": raw_name.strip(),
+                    "helper_ips": helpers
+                })
+
+        # SVI & Helper Address for SVI (Cisco)
         svis = re.findall(r"^interface Vlan(\d+)\n(.*?)(?=^interface |^!)", self.raw_log, re.DOTALL | re.MULTILINE)
         for vid, cfg in svis:
             self._parse_svi_ip(int(vid), cfg)
-
         # Routes
         routes = re.findall(r"^ip route (\S+) (\S+) (\S+)", self.raw_log or "", re.MULTILINE)
         for d, m, nh in routes: self.data["routes"].append({"version": "ipv4", "dest": d, "mask": m, "next_hop": nh})

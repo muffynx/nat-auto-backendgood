@@ -683,6 +683,77 @@ def convert_config_api():
         return jsonify({'status': 'error', 'msg': str(e)}), 500
 
 
+import zipfile
+
+# ✅ API: Convert Bulk (ZIP)
+@app.route('/api/convert_bulk', methods=['POST'])
+def convert_bulk_api():
+    current_user = request.headers.get('X-Username')
+    if not current_user: return jsonify({'msg': 'Unauthorized'}), 401
+
+    if not request.content_type or 'multipart/form-data' not in request.content_type:
+        return jsonify({'msg': 'Must be multipart/form-data'}), 400
+
+    source_type = request.form.get('source_type')
+    target_type = request.form.get('target_type')
+    
+    if not source_type or not target_type:
+        return jsonify({'msg': 'Missing source_type or target_type'}), 400
+
+    uploaded_files = request.files.getlist('files')
+    if not uploaded_files:
+        return jsonify({'msg': 'No files provided'}), 400
+
+    try:
+        memory_file = io.BytesIO()
+        with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for file in uploaded_files:
+                if not file.filename: continue
+                
+                # 1. Read file content and force decode to string
+                log_content = file.read().decode('utf-8', errors='ignore')
+                
+                # 2. Convert Config
+                converter = ConfigConverter(source_type, target_type, log_content)
+                result_config = converter.process()
+                
+                # Clean headers before Excel generation
+                if isinstance(converter.raw_log, str):
+                    for header in ["display current-configuration", "show running-config"]:
+                        if header in converter.raw_log:
+                            parts = converter.raw_log.split(header, 1)
+                            if len(parts) > 1:
+                                converter.raw_log = parts[1]
+                            
+                # Re-parse for Excel (Commented out per request)
+                # if source_type == "hp_comware":
+                #     converter._parse_comware()
+                # elif source_type == "cisco_ios":
+                #     converter._parse_cisco_ios()
+
+                # Generate Excel (Commented out)
+                # excel_data = converter.export_to_excel()
+                
+                # Get base filename
+                base_name = file.filename.rsplit('.', 1)[0]
+                
+                # 3. Add to ZIP
+                zf.writestr(f"{base_name}_converted.txt", result_config)
+                # zf.writestr(f"{base_name}_mapping.xlsx", excel_data)
+
+        memory_file.seek(0)
+        return send_file(
+            memory_file,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name='Batch_Conversion.zip'
+        )
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'status': 'error', 'msg': str(e)}), 500
+
+
 # ✅ API: Export Excel (แก้เพิ่ม Route และ Clean Header)
 @app.route('/api/export_excel', methods=['POST'])
 def export_excel_api():
