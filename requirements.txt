@@ -10,3 +10,4 @@ python-dotenv
 eventlet
 gunicorn
 xlsxwriter
+openpyxl

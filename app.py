@@ -433,6 +433,7 @@ def batch_config_zip():
             ip_col = 'ip address' if 'ip address' in df.columns else 'ip_address'
             user_col = 'username' if 'username' in df.columns else None
             pass_col = 'password' if 'password' in df.columns else None
+            secret_col = 'secret' if 'secret' in df.columns else 'enable' if 'enable' in df.columns else None
             file_col = 'filename'
             type_col = 'device type' if 'device type' in df.columns else 'device_type' if 'device_type' in df.columns else 'vendor' if 'vendor' in df.columns else None
             port_col = 'port' if 'port' in df.columns else None
@@ -475,6 +476,7 @@ def batch_config_zip():
                     'device_type': str(row[type_col]).strip() if type_col and pd.notna(row[type_col]) else 'cisco_ios',
                     'username': str(row[user_col]).strip() if user_col and pd.notna(row[user_col]) else '',
                     'password': str(row[pass_col]).strip() if pass_col and pd.notna(row[pass_col]) else '',
+                    'secret': str(row[secret_col]).strip() if secret_col and pd.notna(row[secret_col]) else '',
                     'port': int(row[port_col]) if port_col and pd.notna(row[port_col]) else 22,
                     # Provide a generic hostname so agent doesn't throw errors
                     'hostname': f'Batch-{ip_addr}'

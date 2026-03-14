@@ -235,8 +235,20 @@ def task_push_config(device, commands):
                     flat.append(sub.strip())
 
         net_connect = ConnectHandler(**get_device_driver(device))
-        if device.get('secret'):
-            net_connect.enable()
+        # 1. เช็คและเข้า Enable Mode เสมอ (ถ้ามันยังไม่ได้เข้า)
+        try:
+            if not net_connect.check_enable_mode():
+                net_connect.enable()
+        except Exception as e:
+            pass
+            
+        # 2. บังคับเข้า Config Mode ไปเลยเพื่อป้องกัน Error "Failed to enter configuration mode"
+        try:
+            if not net_connect.check_config_mode():
+                net_connect.config_mode()
+        except Exception as e:
+            pass
+
         output = net_connect.send_config_set(flat, read_timeout=90)
 
         save_out = ''
