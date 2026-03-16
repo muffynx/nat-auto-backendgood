@@ -1,0 +1,3 @@
+hostname Switch1
+interface Vlan10
+ip address 10.0.0.1 255.255.255.0
