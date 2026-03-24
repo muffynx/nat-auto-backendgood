@@ -5,7 +5,7 @@ a = Analysis(
     ['agent_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[('icons', 'icons/'), ('.env', '.'), ('*.png', '.'), ('*.jpg', '.')],
+    datas=[('icons', 'icons/'), ('.env', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['icons\\logo.jpg'],
+    icon=['icons\\logo.ico'],
 )

@@ -1,4 +1,4 @@
-('F:\\project-net\\nat-auto-backend-main\\nat-auto-backend-main\\build\\agent_gui\\PYZ-00.pyz',
+('F:\\project-net\\nat-auto-backendgood-main\\build\\agent_gui\\PYZ-00.pyz',
  [('PIL',
    'C:\\Users\\popo\\AppData\\Local\\Programs\\Python\\Python310\\lib\\site-packages\\PIL\\__init__.py',
    'PYMODULE'),
