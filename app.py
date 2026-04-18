@@ -32,7 +32,7 @@ agent_connections = {}
 
 # ── Agent Version Management ──────────────────────────────────────
 # เพิ่ม version ทุกครั้งที่ release agent ใหม่
-AGENT_LATEST_VERSION = "1.1.0"
+AGENT_LATEST_VERSION = "1.1.1"  # อัปเดตทุกครั้งที่ build agent ใหม่
 AGENT_DOWNLOAD_URL   = "/download"   # path ใน frontend
 
 # DATABASE
@@ -242,6 +242,10 @@ def handle_task_result(data):
             
         socketio.emit('batch_config_result', data)
 
+    # 4. Topology scan result — forward to the monitoring page
+    elif task_type == 'topology_scan':
+        socketio.emit('topology_result', data)
+
 
 # ────────────────────────────────────────────────
 #             API ROUTES
@@ -319,6 +323,37 @@ def api_batch_config():
         'status': 'dispatched',
         'message': f'Batch config sent to agents ({len(devices)} devices)'
     })
+
+
+
+@app.route('/api/topology_scan', methods=['POST'])
+def api_topology_scan():
+    current_user = request.headers.get('X-Username')
+    if not current_user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    if current_user not in agent_connections.values():
+        return jsonify({'status': 'Failed', 'message': 'Agent Offline: กรุณาเปิดโปรแกรม NETPILOT Agent ก่อน'}), 400
+
+    data       = request.json or {}
+    profile_id = data.get('profile_id')
+
+    query = {'owner': current_user}
+    if profile_id:
+        query['profile_id'] = profile_id
+
+    devices = list(db.devices.find(query))
+    if not devices:
+        return jsonify({'error': 'No devices found in this profile'}), 404
+
+    devices = [serialize_doc(d) for d in devices]
+
+    socketio.emit('execute_task', {
+        'type':    'topology_scan',
+        'devices': devices,
+        'owner':   current_user,
+    })
+
+    return jsonify({'status': 'dispatched', 'total_devices': len(devices)})
 
 
 @app.route('/api/run_backup', methods=['POST'])

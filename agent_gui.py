@@ -68,7 +68,7 @@ DEFAULT_URL    = os.getenv('VPS_URL')
 DEFAULT_WORKERS = int(os.getenv('MAX_WORKERS', '10'))
 
 # ── Current Agent Version — อัปเดตทุกครั้งที่ build ──
-AGENT_VERSION = "1.1.0"
+AGENT_VERSION = "1.1.1"
 
 # Configuration File for storing user-specific tokens
 if getattr(sys, 'frozen', False):
@@ -541,6 +541,137 @@ class AgentThread(threading.Thread):
                 'hostname': hostname,
                 'owner': owner
             })
+
+        # ── TOPOLOGY SCAN ───────────────────────────────
+        elif task_type == 'topology_scan':
+            devices = payload.get('devices', [])
+            self._log("🗺️", f"Topology scan  →  {len(devices)} devices")
+
+            def task_topology(device):
+                """Run LLDP + S/N on one device and return parsed structured data."""
+                from netmiko import ConnectHandler
+                import re
+                hostname = device.get('hostname', '?')
+                ip       = device.get('ip_address', '')
+                try:
+                    conn     = ConnectHandler(**get_device_driver(device))
+                    lldp_raw = conn.send_command('display lldp neighbor-information verbose', read_timeout=60)
+                    sn_raw   = conn.send_command('display device manuinfo',       read_timeout=60)
+                    conn.disconnect()
+
+                    # ── Parse S/N ────────────────────────────
+                    sn = ''
+                    for line in sn_raw.splitlines():
+                        m = re.search(r'DEVICE_SERIAL_NUMBER\s*[:\s]\s*(\S+)', line, re.IGNORECASE)
+                        if not m:
+                            m = re.search(r'Serial\s*Num(?:ber)?\s*[:\s]\s*(\S+)', line, re.IGNORECASE)
+                        if m:
+                            sn = m.group(1)
+                            break
+
+                    # ── Parse LLDP neighbors (display lldp neighbor-information verbose) ──
+                    #
+                    # Format: each neighbor block starts with:
+                    #   "LLDP neighbor-information of port 23[GigabitEthernet1/0/23]:"
+                    # followed by indented fields.
+                    neighbors = []
+                    cur: dict = {}
+                    current_local_port = ''
+                    ipv4_seen = False   # take only first (IPv4) management address
+
+                    for line in lldp_raw.splitlines():
+                        stripped = line.strip()
+
+                        # ── New neighbor block header ─────────────────────
+                        m_hdr = re.match(
+                            r'LLDP neighbor-information of port\s+\d+\[([^\]]+)\]',
+                            stripped, re.IGNORECASE)
+                        if m_hdr:
+                            if cur:
+                                neighbors.append(cur)
+                            current_local_port = m_hdr.group(1).strip()
+                            cur = {
+                                'local_port':   current_local_port,
+                                'neighbor':     '',
+                                'remote_port':  '',
+                                'mgmt_ip':      '',
+                                'port_desc':    '',
+                                'update_time':  '',
+                                'sys_desc':     '',
+                            }
+                            ipv4_seen = False
+                            continue
+
+                        if not cur:
+                            continue
+
+                        # ── Field extraction ──────────────────────────────
+                        def _field(label: str) -> str | None:
+                            m = re.match(
+                                rf'{re.escape(label)}\s*:\s*(.+)',
+                                stripped, re.IGNORECASE)
+                            return m.group(1).strip() if m else None
+
+                        v = _field('System name')
+                        if v:
+                            cur['neighbor'] = v
+                            continue
+
+                        v = _field('System description')
+                        if v and not cur['sys_desc']:
+                            cur['sys_desc'] = v
+                            continue
+
+                        v = _field('Port ID')
+                        if v and not cur['remote_port']:
+                            cur['remote_port'] = v
+                            continue
+
+                        v = _field('Port description')
+                        if v:
+                            cur['port_desc'] = v
+                            continue
+
+                        v = _field('Update time')
+                        if v:
+                            cur['update_time'] = v
+                            continue
+
+                        # Management address — take IPv4 only (first one)
+                        v = _field('Management address')
+                        if v and not ipv4_seen:
+                            # Must look like an IPv4 address
+                            if re.match(r'\d{1,3}(\.\d{1,3}){3}$', v):
+                                cur['mgmt_ip'] = v
+                                ipv4_seen = True
+
+                    if cur and cur.get('neighbor'):
+                        neighbors.append(cur)
+
+                    return {'hostname': hostname, 'ip': ip, 'sn': sn,
+                            'neighbors': neighbors, 'status': 'Success', 'error': ''}
+                except Exception as e:
+                    return {'hostname': hostname, 'ip': ip, 'sn': '',
+                            'neighbors': [], 'status': 'Failed', 'error': str(e)}
+
+            results = []
+            with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+                futures = {ex.submit(task_topology, d): d for d in devices}
+                for fut in as_completed(futures):
+                    dev = futures[fut]
+                    try:
+                        r = fut.result()
+                    except Exception as exc:
+                        r = {'hostname': dev.get('hostname', '?'), 'ip': dev.get('ip_address', ''),
+                             'sn': '', 'neighbors': [], 'status': 'Failed', 'error': str(exc)}
+                    icon = "✅" if r['status'] == 'Success' else "❌"
+                    self._log(icon, f"  └ {r['hostname']}  SN:{r['sn'] or '-'}  neighbors:{len(r['neighbors'])}")
+                    results.append(r)
+
+            self.sio.emit('task_result', {'type': 'topology_scan', 'results': results, 'owner': owner})
+            ok  = sum(1 for r in results if r['status'] == 'Success')
+            err = len(results) - ok
+            self._log("🗺️", f"Topology done  ✅ {ok}  ❌ {err}")
 
         else:
             self._log("❓", f"Unknown task type: {task_type}")
