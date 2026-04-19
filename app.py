@@ -241,9 +241,20 @@ def handle_task_result(data):
             db.batch_reports.insert_one(report_doc)
             
         socketio.emit('batch_config_result', data)
-
     # 4. Topology scan result — forward to the monitoring page
     elif task_type == 'topology_scan':
+        results = data.get('results', [])
+        if owner:
+            for r in results:
+                if r.get('status') == 'Success' and r.get('ip') and r.get('hostname'):
+                    try:
+                        db.devices.update_many(
+                            {'owner': owner, 'ip_address': r['ip']},
+                            {'$set': {'hostname': r['hostname']}}
+                        )
+                    except Exception as e:
+                        print(f"Error updating topology hostname: {e}")
+                        
         socketio.emit('topology_result', data)
 
 

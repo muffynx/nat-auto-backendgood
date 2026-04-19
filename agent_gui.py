@@ -162,6 +162,18 @@ def get_backup_commands(device_type):
             ("Routing Table", "show ip route")
         ]
         
+    # ── HPE ProVision / ArubaOS-Switch ──
+    elif "hp_procurve" in dtype or "provision" in dtype:
+        return [
+            ("Running Configuration", "show running-config"),
+            ("Version & Uptime", "show version"),
+            ("Interface Status", "show interfaces brief"),
+            ("LLDP Neighbors", "show lldp info remote-device detail"),
+            ("MAC Address Table", "show mac-address"),
+            ("ARP Table", "show arp"),
+            ("Routing Table", "show ip route")
+        ]
+        
     # ── HP / Comware / Huawei ──
     elif "hp" in dtype or "comware" in dtype or "huawei" in dtype:
         return [
@@ -556,10 +568,11 @@ class AgentThread(threading.Thread):
                 dtype    = device.get('device_type', '').lower()
 
                 # ── Per-vendor commands ───────────────────────────────
-                is_ruckus  = 'fastiron' in dtype or 'ruckus' in dtype
-                is_ios     = 'cisco' in dtype or 'hp_procurve' in dtype
-                is_comware = 'comware' in dtype or 'hp_comware' in dtype or 'huawei' in dtype
-                is_aoscx   = 'aruba_aoscx' in dtype or 'aoscx' in dtype
+                is_ruckus   = 'fastiron' in dtype or 'ruckus' in dtype
+                is_procurve = 'hp_procurve' in dtype or 'provision' in dtype
+                is_ios      = 'cisco' in dtype
+                is_comware  = 'comware' in dtype or 'hp_comware' in dtype or 'huawei' in dtype
+                is_aoscx    = 'aruba_aoscx' in dtype or 'aoscx' in dtype
 
                 if is_ruckus or is_ios:
                     lldp_cmd = 'show lldp neighbors detail'
@@ -569,12 +582,23 @@ class AgentThread(threading.Thread):
                     lldp_cmd = 'show lldp neighbor-info detail'
                     sn_cmd   = 'show system'
 
+                elif is_procurve:
+                    lldp_cmd = 'show lldp info remote-device detail'
+                    sn_cmd   = 'show system information'
+
                 else:  # Comware
                     lldp_cmd = 'display lldp neighbor-information verbose'
                     sn_cmd   = 'display device manuinfo'
 
                 try:
                     conn     = ConnectHandler(**get_device_driver(device))
+                    
+                    try:
+                        rp = conn.find_prompt()
+                        real_hostname = re.sub(r'^[<\[]+|[>\]#$]*$', '', rp).strip()
+                    except:
+                        real_hostname = hostname
+
                     lldp_raw = conn.send_command(lldp_cmd, read_timeout=60)
                     sn_raw   = conn.send_command(sn_cmd,   read_timeout=60)
                     conn.disconnect()
@@ -605,6 +629,7 @@ class AgentThread(threading.Thread):
 
                     fmt = 'ruckus' if (is_ruckus or is_ios) else \
                     'aoscx'  if is_aoscx else \
+                    'procurve' if is_procurve else \
                     'comware'
 
                     def flush_cur(c: dict, lst: list):
@@ -730,6 +755,52 @@ class AgentThread(threading.Thread):
                                 cur['mgmt_ip'] = v.split(',')[0]
                                 continue
 
+                    # ════ PROCURVE Parser ════
+                    elif fmt == 'procurve':
+                        for line in lldp_raw.splitlines():
+                            stripped = line.strip()
+                            m_hdr = re.match(r'Local Port\s*:\s*(\S+)', stripped, re.IGNORECASE)
+
+                            if m_hdr:
+                                flush_cur(cur, neighbors)
+                                cur = {
+                                    'local_port':  m_hdr.group(1).strip(),
+                                    'neighbor':    '',
+                                    'remote_port': '',
+                                    'mgmt_ip':     '',
+                                    'port_desc':   '',
+                                    'update_time': '',
+                                    'sys_desc':    '',
+                                }
+                                ipv4_seen = False
+                                continue
+
+                            if not cur:
+                                continue
+
+                            def _field(label: str):
+                                m = re.match(rf'{re.escape(label)}(?:\s*\(.*?\))?\s*:\s*(.+)', stripped, re.IGNORECASE)
+                                return m.group(1).strip() if m else None
+
+                            v = _field('SysName')
+                            if v: cur['neighbor'] = v; continue
+
+                            v = _field('System Descr')
+                            if v and not cur['sys_desc']: cur['sys_desc'] = v; continue
+
+                            v = _field('PortId')
+                            if v and not cur['remote_port']: cur['remote_port'] = v; continue
+
+                            v = _field('PortDescr')
+                            if v: cur['port_desc'] = v; continue
+                            
+                            # HP ProCurve IP format under "Remote Management Address"
+                            v = _field('Address') # e.g. "Address : 10.116.254.1"
+                            if v and not ipv4_seen and re.match(r'\d{1,3}(\.\d{1,3}){3}', v):
+                                cur['mgmt_ip'] = v
+                                ipv4_seen = True
+                                continue
+
                     # ════ COMWARE Parser ════
                     else:
                         for line in lldp_raw.splitlines():
@@ -783,7 +854,7 @@ class AgentThread(threading.Thread):
                     # เก็บข้อมูลตัวสุดท้ายหลังจากจบ Loop ของแต่ละ format
                     flush_cur(cur, neighbors)
                     return {
-                    'hostname': hostname, 
+                    'hostname': real_hostname, 
                     'ip': ip, 
                     'sn': sn,
                     'neighbors': neighbors, 
