@@ -553,106 +553,188 @@ class AgentThread(threading.Thread):
                 import re
                 hostname = device.get('hostname', '?')
                 ip       = device.get('ip_address', '')
+                dtype    = device.get('device_type', '').lower()
+
+                # ── Per-vendor commands ───────────────────────────────
+                is_ruckus = 'fastiron' in dtype or 'ruckus' in dtype
+                is_ios    = 'cisco' in dtype or 'aruba' in dtype or 'hp_procurve' in dtype
+                is_comware = 'comware' in dtype or 'hp_comware' in dtype or 'huawei' in dtype
+
+                if is_ruckus or is_ios:
+                    lldp_cmd = 'show lldp neighbors detail'
+                    sn_cmd   = 'show version'
+                else:  # default = Comware / HPE 5xxx
+                    lldp_cmd = 'display lldp neighbor-information verbose'
+                    sn_cmd   = 'display device manuinfo'
+
                 try:
                     conn     = ConnectHandler(**get_device_driver(device))
-                    lldp_raw = conn.send_command('display lldp neighbor-information verbose', read_timeout=60)
-                    sn_raw   = conn.send_command('display device manuinfo',       read_timeout=60)
+                    lldp_raw = conn.send_command(lldp_cmd, read_timeout=60)
+                    sn_raw   = conn.send_command(sn_cmd,   read_timeout=60)
                     conn.disconnect()
 
-                    # ── Parse S/N ────────────────────────────
+                    # ── Parse S/N ────────────────────────────────────
                     sn = ''
                     for line in sn_raw.splitlines():
-                        m = re.search(r'DEVICE_SERIAL_NUMBER\s*[:\s]\s*(\S+)', line, re.IGNORECASE)
+                        # Ruckus: "      Serial  #:DUH3221T0BZ"
+                        m = re.search(r'Serial\s+#\s*:\s*(\S+)', line, re.IGNORECASE)
+                        if not m:
+                            m = re.search(r'DEVICE_SERIAL_NUMBER\s*[:\s]\s*(\S+)', line, re.IGNORECASE)
                         if not m:
                             m = re.search(r'Serial\s*Num(?:ber)?\s*[:\s]\s*(\S+)', line, re.IGNORECASE)
                         if m:
                             sn = m.group(1)
                             break
 
-                    # ── Parse LLDP neighbors (display lldp neighbor-information verbose) ──
-                    #
-                    # Format: each neighbor block starts with:
-                    #   "LLDP neighbor-information of port 23[GigabitEthernet1/0/23]:"
-                    # followed by indented fields.
+                    # ── Helper: strip quotes from field values ────────
+                    def unquote(s: str) -> str:
+                        return s.strip().strip('"').strip("'")
+
+                    # ── LLDP parser (auto-detect format) ─────────────
                     neighbors = []
                     cur: dict = {}
-                    current_local_port = ''
-                    ipv4_seen = False   # take only first (IPv4) management address
+                    ipv4_seen = False
 
+                    # Detect format by scanning first non-empty line
+                    fmt = 'comware'
                     for line in lldp_raw.splitlines():
-                        stripped = line.strip()
+                        s = line.strip()
+                        if s:
+                            if s.lower().startswith('local port:'):
+                                fmt = 'ruckus'
+                            break
 
-                        # ── New neighbor block header ─────────────────────
-                        m_hdr = re.match(
-                            r'LLDP neighbor-information of port\s+\d+\[([^\]]+)\]',
-                            stripped, re.IGNORECASE)
-                        if m_hdr:
-                            if cur:
-                                neighbors.append(cur)
-                            current_local_port = m_hdr.group(1).strip()
-                            cur = {
-                                'local_port':   current_local_port,
-                                'neighbor':     '',
-                                'remote_port':  '',
-                                'mgmt_ip':      '',
-                                'port_desc':    '',
-                                'update_time':  '',
-                                'sys_desc':     '',
-                            }
-                            ipv4_seen = False
-                            continue
+                    # ════ RUCKUS / IOS "show lldp neighbors detail" parser ════
+                    if fmt == 'ruckus':
+                        for line in lldp_raw.splitlines():
+                            stripped = line.strip()
 
-                        if not cur:
-                            continue
+                            # Block header: "Local port: 1/1/23"
+                            m_hdr = re.match(r'Local port:\s*(\S+)', stripped, re.IGNORECASE)
+                            if m_hdr:
+                                if cur and cur.get('neighbor'):
+                                    neighbors.append(cur)
+                                cur = {
+                                    'local_port':  m_hdr.group(1).strip(),
+                                    'neighbor':    '',
+                                    'remote_port': '',
+                                    'mgmt_ip':     '',
+                                    'port_desc':   '',
+                                    'update_time': '',
+                                    'sys_desc':    '',
+                                }
+                                ipv4_seen = False
+                                continue
 
-                        # ── Field extraction ──────────────────────────────
-                        def _field(label: str) -> str | None:
-                            m = re.match(
-                                rf'{re.escape(label)}\s*:\s*(.+)',
-                                stripped, re.IGNORECASE)
-                            return m.group(1).strip() if m else None
+                            if not cur:
+                                continue
 
-                        v = _field('System name')
-                        if v:
-                            cur['neighbor'] = v
-                            continue
+                            # Strip leading "+ " or "  + " prefix from Ruckus lines
+                            clean = re.sub(r'^\+\s*', '', stripped)
 
-                        v = _field('System description')
-                        if v and not cur['sys_desc']:
-                            cur['sys_desc'] = v
-                            continue
+                            def _rf(label: str):
+                                m = re.match(rf'{re.escape(label)}\s*:\s*(.+)', clean, re.IGNORECASE)
+                                return unquote(m.group(1)) if m else None
 
-                        v = _field('Port ID')
-                        if v and not cur['remote_port']:
-                            cur['remote_port'] = v
-                            continue
+                            v = _rf('System name')
+                            if v:
+                                cur['neighbor'] = v
+                                continue
 
-                        v = _field('Port description')
-                        if v:
-                            cur['port_desc'] = v
-                            continue
+                            v = _rf('System description')
+                            if v and not cur['sys_desc']:
+                                cur['sys_desc'] = v
+                                continue
 
-                        v = _field('Update time')
-                        if v:
-                            cur['update_time'] = v
-                            continue
+                            # "Port ID (interface name): 1/1/21"
+                            v = _rf('Port ID')
+                            if v and not cur['remote_port']:
+                                cur['remote_port'] = v.split('(')[0].strip() if '(' in v else v
+                                continue
 
-                        # Management address — take IPv4 only (first one)
-                        v = _field('Management address')
-                        if v and not ipv4_seen:
-                            # Must look like an IPv4 address
-                            if re.match(r'\d{1,3}(\.\d{1,3}){3}$', v):
-                                cur['mgmt_ip'] = v
+                            v = _rf('Port description')
+                            if v:
+                                cur['port_desc'] = v
+                                continue
+
+                            # "Management address (IPv4): 10.x.x.x"
+                            m_ip = re.match(
+                                r'Management address\s*\(IPv4\)\s*:\s*([\d.]+)', clean, re.IGNORECASE)
+                            if m_ip and not ipv4_seen:
+                                cur['mgmt_ip'] = m_ip.group(1)
                                 ipv4_seen = True
+                                continue
 
-                    if cur and cur.get('neighbor'):
-                        neighbors.append(cur)
+                        if cur and cur.get('neighbor'):
+                            neighbors.append(cur)
+
+                    # ════ COMWARE "display lldp neighbor-information verbose" parser ════
+                    else:
+                        for line in lldp_raw.splitlines():
+                            stripped = line.strip()
+
+                            m_hdr = re.match(
+                                r'LLDP neighbor-information of port\s+\d+\[([^\]]+)\]',
+                                stripped, re.IGNORECASE)
+                            if m_hdr:
+                                if cur:
+                                    neighbors.append(cur)
+                                cur = {
+                                    'local_port':  m_hdr.group(1).strip(),
+                                    'neighbor':    '',
+                                    'remote_port': '',
+                                    'mgmt_ip':     '',
+                                    'port_desc':   '',
+                                    'update_time': '',
+                                    'sys_desc':    '',
+                                }
+                                ipv4_seen = False
+                                continue
+
+                            if not cur:
+                                continue
+
+                            def _field(label: str):
+                                m = re.match(
+                                    rf'{re.escape(label)}\s*:\s*(.+)',
+                                    stripped, re.IGNORECASE)
+                                return m.group(1).strip() if m else None
+
+                            v = _field('System name')
+                            if v:
+                                cur['neighbor'] = v; continue
+
+                            v = _field('System description')
+                            if v and not cur['sys_desc']:
+                                cur['sys_desc'] = v; continue
+
+                            v = _field('Port ID')
+                            if v and not cur['remote_port']:
+                                cur['remote_port'] = v; continue
+
+                            v = _field('Port description')
+                            if v:
+                                cur['port_desc'] = v; continue
+
+                            v = _field('Update time')
+                            if v:
+                                cur['update_time'] = v; continue
+
+                            v = _field('Management address')
+                            if v and not ipv4_seen:
+                                if re.match(r'\d{1,3}(\.\d{1,3}){3}$', v):
+                                    cur['mgmt_ip'] = v
+                                    ipv4_seen = True
+
+                        if cur and cur.get('neighbor'):
+                            neighbors.append(cur)
 
                     return {'hostname': hostname, 'ip': ip, 'sn': sn,
                             'neighbors': neighbors, 'status': 'Success', 'error': ''}
                 except Exception as e:
                     return {'hostname': hostname, 'ip': ip, 'sn': '',
                             'neighbors': [], 'status': 'Failed', 'error': str(e)}
+
 
             results = []
             with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
